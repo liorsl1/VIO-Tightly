@@ -27,6 +27,21 @@ class IMUCalibration:
     gyro_bias_rw: float = 1.9393e-5  # rad/s^2/sqrt(Hz)
     gravity: np.ndarray = field(default_factory=lambda: np.array([0, 0, -9.81]))
 
+    def bias_between_sigmas(self, dt: float) -> np.ndarray:
+        """Compute discrete bias noise sigmas for a BetweenFactor over interval dt.
+
+        Converts continuous-time random walk densities to discrete sigmas:
+            sigma_discrete = sigma_rw * sqrt(dt)
+
+        Returns:
+            6-vector [accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z]
+        """
+        sqrt_dt = np.sqrt(dt)
+        accel_sigma = self.accel_bias_rw * sqrt_dt
+        gyro_sigma = self.gyro_bias_rw * sqrt_dt
+        return np.array([accel_sigma, accel_sigma, accel_sigma,
+                         gyro_sigma, gyro_sigma, gyro_sigma])
+
 
 class IMUBuffer:
     """Ring buffer for high-rate IMU measurements."""

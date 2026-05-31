@@ -81,7 +81,7 @@ def main():
     print("Initializing VIO system...")
     imu_calib = IMUCalibration()  # Using default noise values for now
     imu_pipeline = IMUPipeline(imu_calib)
-    optimizer = GraphOptimizer(use_isam=True, body_P_sensor=data_manager.T_imu_cam0)
+    optimizer = GraphOptimizer(use_isam=True, body_P_sensor=data_manager.T_imu_cam0, imu_calib=imu_calib)
 
     # --- Initial State (at the time of the first frame) ---
     # We assume the system starts at the origin, at rest.
@@ -240,8 +240,6 @@ def main():
                 )
 
             # 5. Add loop-closure reprojection factors after a burn-in period.
-            # NOTE: BetweenFactor<Pose3> would be stronger but requires an independent
-            # relative pose measurement (e.g., PnP from re-matched keyframe images).
             # Computing relative pose from the current GTSAM estimate is tautological —
             # it encodes drift and cannot correct it. For now, we use reprojection factors
             # which at least provide genuine pixel-level measurements.

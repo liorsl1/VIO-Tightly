@@ -17,12 +17,14 @@ class GraphOptimizer:
       - Natural loop closure integration via re-observation factors
       - Robust Huber loss on reprojection errors
     """
-    def __init__(self, use_isam: bool = True, body_P_sensor: np.ndarray = None):
+    def __init__(self, use_isam: bool = True, body_P_sensor: np.ndarray = None, imu_calib=None):
         if gtsam is None:
             self.isam = None
             self.graph = None
             self.initial = None
             return
+
+        self.imu_calib = imu_calib  # IMUCalibration for bias noise computation
 
         # body_P_sensor: 4x4 transform T_body_cam (pose of camera in body/IMU frame)
         if body_P_sensor is not None:
@@ -53,10 +55,11 @@ class GraphOptimizer:
         self._cached_estimate = None
 
         # --- Noise models ---
+        # Prior: tight rotation (0.03 rad ≈ 1.7°), moderate translation (0.4m)
         self.prior_pose_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([0.1, 0.1, 0.1, 0.3, 0.3, 0.3]))
+            np.array([0.03, 0.03, 0.03, 0.4, 0.4, 0.4]))
         self.prior_vel_noise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
-        self.prior_bias_noise = gtsam.noiseModel.Isotropic.Sigma(6, 1e-2)
+        self.prior_bias_noise = gtsam.noiseModel.Isotropic.Sigma(6, 1e-3)
         # Landmark regularization prior (sigma=1.5m).
         # Tight enough to prevent ISAM2 from pushing landmarks to degenerate positions
         # during relinearization, but loose enough not to bias converged estimates.
@@ -127,10 +130,11 @@ class GraphOptimizer:
                               B(prev_idx), preint)
         self.graph.add(fac)
         # Bias random walk between consecutive states
-        # Sigma should be loose enough to accommodate actual bias drift over the
-        # inter-keyframe interval. Reference: GTSAM official example uses variance=0.1
-        # (sigma~0.316). For EuRoC with large frame steps, sigma=0.3 is appropriate.
-        bias_noise = gtsam.noiseModel.Isotropic.Sigma(6, 0.3)
+        # Discrete noise = continuous RW density * sqrt(dt)
+        # Uses preintegration interval for proper scaling
+        dt = preint.deltaTij()
+        bias_sigmas = self.imu_calib.bias_between_sigmas(dt)
+        bias_noise = gtsam.noiseModel.Diagonal.Sigmas(bias_sigmas)
         self.graph.add(gtsam.BetweenFactorConstantBias(
             B(prev_idx), B(curr_idx),
             gtsam.imuBias.ConstantBias(), bias_noise))
