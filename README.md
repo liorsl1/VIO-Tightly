@@ -10,6 +10,8 @@ A real-time stereo visual-inertial odometry system using factor graph optimizati
 
 <p align="center">
   <img src="docs/GTSAM-VIO_update_.gif" alt="VIO Pipeline Demo" width="800"/>
+  <br/>
+  <sub>Azure colored dots — Re-visited landmarks from previous frames (valid loop closure candidates)</sub>
 </p>
 
 ---
