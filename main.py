@@ -9,7 +9,7 @@ import sys
 
 sys.path.append(r"f:\Code\SLAM")
 from data_manager import DataManager
-from vfeature import vFeature
+from v_frontend import vFeature
 from imu_pipeline import IMUPipeline, IMUCalibration, IMUSample
 from vio_optimizer import GraphOptimizer, X, V, B, L  # Add X, V, B, L imports
 from vio_visualizer import VIOVisualizer

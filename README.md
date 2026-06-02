@@ -34,7 +34,7 @@ graph LR
 
 ## Pipeline Components
 
-### 1. Visual Frontend (`vfeature.py`)
+### 1. Visual Frontend (`v_frontend.py`)
 
 Processes stereo image pairs to produce landmark observations and 3D triangulations.
 
@@ -101,7 +101,7 @@ This is critical — a naive isotropic σ=0.3 makes the bias factor ~21,000× to
 
 ---
 
-### 4. Loop Closure Detection (`vfeature.py` — HNSW)
+### 4. Loop Closure Detection (`v_frontend.py` — HNSW)
 
 Descriptor-based place recognition using an approximate nearest-neighbor index.
 
