@@ -94,7 +94,7 @@ where `Δt` is the preintegration interval (`preint.deltaTij()`). This yields a 
 | Accelerometer | 3.0e-3 m/s³/√Hz | ~2.1e-3 |
 | Gyroscope | 1.9e-5 rad/s²/√Hz | ~1.4e-5 |
 
-This is critical — a naive isotropic σ=0.3 makes the bias factor ~21,000× too loose for gyroscope, allowing bias to absorb real motion and causing trajectory drift. (Initially using this naive value, the trajectory exhibited severe drift inferior accuracy.) The properly scaled noise constrains bias evolution to physically plausible rates.
+This is critical — a naive isotropic σ=0.3 makes the bias factor ~21,000× too loose for gyroscope, allowing bias to absorb real motion and causing trajectory drift. (Initially using this naive value, the trajectory exhibited severe drift & inferior accuracy.) The properly scaled noise constrains bias evolution to physically plausible rates.
 
 **Prior Noise**: Tight rotation prior (σ=0.03 rad ≈ 1,7°) and bias prior (σ=1e-3) anchor the initial state, preventing early heading divergence.
 
