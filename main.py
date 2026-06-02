@@ -1,7 +1,3 @@
-# from imu_utils import align_ground_truth_to_gravity_world, align_ground_truth_to_z_gravity_frame, create_gravity_aligned_coordinate_system, transform_imu_to_z_gravity_frame, transform_vicon_to_body_frame
-# from rel_pose_vis import RelativePoseVisualizer
-# from vslam import *
-# from factor_graph_vio import VIFusionGraphISAM2
 import os
 import cv2
 import numpy as np
@@ -20,6 +16,58 @@ from vio_visualizer import VIOVisualizer
 import gtsam
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+
+def compute_ate(est_positions, gt_positions):
+    """Compute Absolute Trajectory Error (ATE) with SE(3) Umeyama alignment.
+
+    Finds the optimal rotation R, translation t that minimizes:
+        sum_i || gt_i - (R @ est_i + t) ||^2
+
+    Returns:
+        ate_rmse: Root mean square error after alignment (meters).
+        ate_errors: Per-frame errors after alignment.
+        R_align: 3x3 alignment rotation.
+        t_align: 3-vector alignment translation.
+    """
+    est = np.array(est_positions)  # (N, 3)
+    gt = np.array(gt_positions)    # (N, 3)
+    n = len(est)
+    if n < 3:
+        return 0.0, np.zeros(n), np.eye(3), np.zeros(3)
+
+    # Centroids
+    est_mean = est.mean(axis=0)
+    gt_mean = gt.mean(axis=0)
+
+    # Center the point sets
+    est_centered = est - est_mean
+    gt_centered = gt - gt_mean
+
+    # Cross-covariance matrix
+    H = est_centered.T @ gt_centered  # (3, 3)
+
+    # SVD
+    U, S, Vt = np.linalg.svd(H)
+
+    # Ensure proper rotation (det = +1)
+    d = np.linalg.det(Vt.T @ U.T)
+    sign_matrix = np.diag([1, 1, d])
+
+    # Optimal rotation
+    R_align = Vt.T @ sign_matrix @ U.T
+
+    # Optimal translation
+    t_align = gt_mean - R_align @ est_mean
+
+    # Apply alignment
+    est_aligned = (R_align @ est.T).T + t_align
+
+    # Per-frame errors
+    ate_errors = np.linalg.norm(gt - est_aligned, axis=1)
+    ate_rmse = float(np.sqrt(np.mean(ate_errors ** 2)))
+
+    return ate_rmse, ate_errors, R_align, t_align
 
 
 def main():
@@ -102,6 +150,20 @@ def main():
     feature_pipeline.initialize()
 
     print("VIO system initialized.")
+
+    # --- Ground Truth ---
+    gt_df = data_manager.gt_df
+
+    def get_gt_position(timestamp):
+        """Look up the nearest ground truth position for a given timestamp."""
+        idx = gt_df["timestamp"].searchsorted(timestamp)
+        idx = min(idx, len(gt_df) - 1)
+        row = gt_df.iloc[idx]
+        return np.array([row["p_x"], row["p_y"], row["p_z"]])
+
+    # --- ATE Tracking ---
+    ate_est_positions = []  # Estimated positions (from GTSAM)
+    ate_gt_positions = []   # Corresponding GT positions
 
     # --- Visualization ---
     visualizer = VIOVisualizer(max_trail_length=500, update_interval=0.05)
@@ -209,6 +271,7 @@ def main():
                 num_states=1,
                 imu_samples_count=0,
                 metrics=None,
+                gt_pose=get_gt_position(current_cam_timestamp),
             )
 
         # --- C. Add New State and Factors to the Graph ---
@@ -291,12 +354,36 @@ def main():
                 f"Error: {metrics['total_error']:.2f} | Avg/factor: {metrics['avg_error_per_factor']:.4f} | Vars: {metrics['n_variables']} | Factors: {metrics['n_factors']}"
             )
 
+            # --- Covariance & Degeneracy Detection ---
+            pos_cov = optimizer.get_position_covariance(i)
+            degeneracy = optimizer.detect_degeneracy(i)
+            if degeneracy['degenerate']:
+                eigs = degeneracy['position_eigenvalues']
+                print(f"  ⚠ DEGENERATE MOTION: {degeneracy['motion_type']}")
+                print(f"    Eigenvalues: [{eigs[0]:.6f}, {eigs[1]:.6f}, {eigs[2]:.6f}]")
+                print(f"    Condition number: {degeneracy['condition_number']:.1f}")
+                print(f"    Worst direction (world): {degeneracy['degenerate_direction']}")
+            elif pos_cov is not None:
+                eigs = degeneracy['position_eigenvalues']
+                print(f"  Pose uncertainty (3σ): [{np.sqrt(eigs[0])*3:.3f}, {np.sqrt(eigs[1])*3:.3f}, {np.sqrt(eigs[2])*3:.3f}] m")
+
             # --- Adaptive IMU-guided optical flow ---
             prev_use_imu = use_imu_for_flow
             use_imu_for_flow = metrics['avg_error_per_factor'] < imu_flow_error_threshold
             if use_imu_for_flow != prev_use_imu:
                 status = "ENABLED" if use_imu_for_flow else "DISABLED"
                 print(f"** IMU-guided optical flow {status} (avg_err={metrics['avg_error_per_factor']:.2f}, threshold={imu_flow_error_threshold})")
+
+            # --- ATE (computed here so we can pass to visualizer) ---
+            ate_rmse_current = None
+            current_est_for_ate = optimizer.get_current_estimate()
+            if current_est_for_ate is not None and current_est_for_ate.exists(X(i)):
+                est_pos = current_est_for_ate.atPose3(X(i)).translation()
+                ate_est_positions.append(np.array([est_pos[0], est_pos[1], est_pos[2]]))
+                ate_gt_positions.append(get_gt_position(current_cam_timestamp))
+                if len(ate_est_positions) >= 3:
+                    ate_rmse_current, ate_errors, _, _ = compute_ate(ate_est_positions, ate_gt_positions)
+                    print(f"  ATE (RMSE): {ate_rmse_current:.4f} m | Current frame error: {ate_errors[-1]:.4f} m")
 
             # --- E. Visualize ---
             # Collect loop closure landmark IDs (only geometrically visible ones)
@@ -332,10 +419,26 @@ def main():
                 imu_samples_count=len(imu_samples),
                 metrics=metrics,
                 loop_closure_ids=lc_ids,
+                gt_pose=get_gt_position(current_cam_timestamp),
+                pose_covariance=pos_cov,
+                ate_rmse=ate_rmse_current,
             )
 
         # Update timestamp for the next iteration
         prev_cam_timestamp = current_cam_timestamp
+
+    # --- Final ATE Summary ---
+    if len(ate_est_positions) >= 3:
+        ate_rmse, ate_errors, R_align, t_align = compute_ate(ate_est_positions, ate_gt_positions)
+        print("\n" + "=" * 60)
+        print(f"  FINAL ATE (Absolute Trajectory Error)")
+        print(f"  RMSE:    {ate_rmse:.4f} m")
+        print(f"  Mean:    {np.mean(ate_errors):.4f} m")
+        print(f"  Median:  {np.median(ate_errors):.4f} m")
+        print(f"  Max:     {np.max(ate_errors):.4f} m")
+        print(f"  Std:     {np.std(ate_errors):.4f} m")
+        print(f"  Frames:  {len(ate_errors)}")
+        print("=" * 60)
 
     # Cleanup
     visualizer.close()

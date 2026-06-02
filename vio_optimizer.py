@@ -36,6 +36,12 @@ class GraphOptimizer:
 
         self.use_isam = use_isam
         self.isam_params = gtsam.ISAM2Params()
+        # If I want to use Dogleg insead of standard Gauss-Newton, I can set these parameters:
+        # dogleg_params = gtsam.ISAM2DoglegParams()
+        # dogleg_params.setInitialDelta(5.0)
+        # self.isam_params.setOptimizationParams(dogleg_params)
+        # self.isam_params.setRelinearizeThreshold(0.1)
+        # self.isam_params.relinearizeSkip = 3
         self.isam_params.setRelinearizeThreshold(0.01)
         self.isam_params.relinearizeSkip = 1
         self.isam = gtsam.ISAM2(self.isam_params) if use_isam else None
@@ -55,9 +61,9 @@ class GraphOptimizer:
         self._cached_estimate = None
 
         # --- Noise models ---
-        # Prior: tight rotation (0.03 rad ≈ 1.7°), moderate translation (0.4m)
+        # Prior: tight rotation (0.03 rad ≈ 1.7°), moderate translation (0.3m)
         self.prior_pose_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([0.03, 0.03, 0.03, 0.4, 0.4, 0.4]))
+            np.array([0.03, 0.03, 0.03, 0.3, 0.3, 0.3]))
         self.prior_vel_noise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
         self.prior_bias_noise = gtsam.noiseModel.Isotropic.Sigma(6, 1e-3)
         # Landmark regularization prior (sigma=1.5m).
@@ -440,3 +446,78 @@ class GraphOptimizer:
             "n_landmarks": len(self.landmark_initialized),
         }
         return metrics
+
+    # ==================== Covariance & Degeneracy ====================
+
+    def get_pose_covariance(self, state_idx: int) -> Optional[np.ndarray]:
+        """Get the 6x6 marginal covariance for pose X(state_idx).
+
+        Returns None if computation fails. Ordered: [rot_x, rot_y, rot_z, tx, ty, tz].
+        """
+        if gtsam is None or self.isam is None:
+            return None
+        try:
+            return self.isam.marginalCovariance(X(state_idx))
+        except Exception:
+            return None
+
+    def get_position_covariance(self, state_idx: int) -> Optional[np.ndarray]:
+        """Get the 3x3 position-only marginal covariance (translation block [3:6, 3:6])."""
+        cov6 = self.get_pose_covariance(state_idx)
+        if cov6 is None:
+            return None
+        return cov6[3:6, 3:6]
+
+    def detect_degeneracy(self, state_idx: int) -> Dict:
+        """Analyze pose covariance to detect degenerate motion conditions.
+
+        Returns:
+            'position_eigenvalues': sorted eigenvalues of position cov (ascending)
+            'position_eigenvectors': corresponding eigenvectors (columns)
+            'condition_number': max/min eigenvalue ratio (high = degenerate)
+            'degenerate': bool
+            'degenerate_direction': unit vector of worst-constrained direction
+            'motion_type': string description
+        """
+        result = {
+            'position_eigenvalues': None,
+            'position_eigenvectors': None,
+            'condition_number': 1.0,
+            'degenerate': False,
+            'degenerate_direction': None,
+            'motion_type': 'normal',
+        }
+
+        pos_cov = self.get_position_covariance(state_idx)
+        if pos_cov is None:
+            return result
+
+        eigenvalues, eigenvectors = np.linalg.eigh(pos_cov)
+        result['position_eigenvalues'] = eigenvalues
+        result['position_eigenvectors'] = eigenvectors
+
+        min_eig = max(eigenvalues[0], 1e-12)
+        max_eig = eigenvalues[-1]
+        condition_number = max_eig / min_eig
+        result['condition_number'] = condition_number
+        result['degenerate_direction'] = eigenvectors[:, -1]
+
+        CONDITION_THRESHOLD = 100.0
+        LARGE_UNCERTAINTY_M2 = 1.0
+
+        if condition_number > CONDITION_THRESHOLD:
+            result['degenerate'] = True
+            worst_dir = eigenvectors[:, -1]
+            if abs(worst_dir[2]) > 0.8:
+                result['motion_type'] = 'vertical_degeneracy (scale/gravity unobservable)'
+            else:
+                result['motion_type'] = 'lateral_degeneracy (insufficient parallax)'
+        elif max_eig > LARGE_UNCERTAINTY_M2:
+            result['degenerate'] = True
+            result['motion_type'] = 'high_overall_uncertainty'
+
+        if all(e > 0.5 for e in eigenvalues):
+            result['degenerate'] = True
+            result['motion_type'] = 'pure_rotation (no translational motion observed)'
+
+        return result

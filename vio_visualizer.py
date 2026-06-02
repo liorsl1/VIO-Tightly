@@ -36,6 +36,7 @@ class VIOVisualizer:
         self.trajectory_poses = []       # List of (x, y, z)
         self.trajectory_orientations = []  # List of 3x3 rotation matrices
         self.all_landmarks_3d = {}       # {landmark_id: np.array([x,y,z])}
+        self.gt_trajectory_poses = []    # Ground truth positions
         self.frame_idx = 0
 
         # Timing
@@ -87,6 +88,9 @@ class VIOVisualizer:
         imu_samples_count=0,
         metrics=None,
         loop_closure_ids=None,
+        gt_pose=None,
+        pose_covariance=None,
+        ate_rmse=None,
     ):
         """
         Main update call - feed data from the VIO loop each frame.
@@ -102,6 +106,9 @@ class VIOVisualizer:
             num_states: Number of state nodes in the graph.
             imu_samples_count: Number of IMU samples integrated this frame.
             metrics: Dict from optimizer.diagnostics().
+            gt_pose: Ground truth position as np.array([x, y, z]) or None.
+            pose_covariance: 3x3 position covariance matrix or None.
+            ate_rmse: Current ATE RMSE value (meters) or None.
         """
         self.frame_idx = frame_idx
 
@@ -117,6 +124,10 @@ class VIOVisualizer:
         if gtsam_estimate is not None:
             self._extract_trajectory(gtsam_estimate, num_states)
 
+        # --- Accumulate ground truth trajectory ---
+        if gt_pose is not None:
+            self.gt_trajectory_poses.append(gt_pose)
+
         # --- Log camera images with feature overlays ---
         if left_img is not None:
             self._log_camera_images(left_img, right_img, observations)
@@ -127,8 +138,12 @@ class VIOVisualizer:
         # --- Log trajectory poses ---
         self._log_trajectory()
 
+        # --- Log pose uncertainty ellipsoid ---
+        if pose_covariance is not None and len(self.trajectory_poses) > 0:
+            self._log_covariance_ellipsoid(pose_covariance)
+
         # --- Log time-series metrics ---
-        self._log_metrics(metrics, imu_samples_count, observations)
+        self._log_metrics(metrics, imu_samples_count, observations, ate_rmse)
 
     def _accumulate_gtsam_landmarks(self, estimate):
         """Extract optimized landmarks from GTSAM and accumulate into the point cloud."""
@@ -247,6 +262,17 @@ class VIOVisualizer:
             rr.LineStrips3D([traj], colors=[[255, 50, 50]]),
         )
 
+        # Log ground truth trajectory in green (shifted to start at same origin as estimate)
+        if len(self.gt_trajectory_poses) >= 2:
+            gt_traj = np.array(self.gt_trajectory_poses, dtype=np.float32)
+            # Shift GT so its first point aligns with the estimated trajectory's first point
+            gt_offset = self.trajectory_poses[0] - gt_traj[0]
+            gt_traj_aligned = gt_traj + gt_offset
+            rr.log(
+                "world/ground_truth",
+                rr.LineStrips3D([gt_traj_aligned], colors=[[50, 255, 50, 140]]),
+            )
+
         # Log current pose as a coordinate frame
         if self.trajectory_orientations:
             pos = self.trajectory_poses[-1]
@@ -298,7 +324,7 @@ class VIOVisualizer:
             rr.Points3D(pose_centers, colors=[[0, 0, 0]] * len(pose_centers), radii=0.03),
         )
 
-    def _log_metrics(self, metrics, imu_samples_count, observations):
+    def _log_metrics(self, metrics, imu_samples_count, observations, ate_rmse=None):
         """Log time-series metrics."""
         # Optimization error
         if metrics:
@@ -310,6 +336,10 @@ class VIOVisualizer:
                 "metrics/error/total",
                 rr.Scalars(metrics.get("total_error", 0)),
             )
+
+        # ATE
+        if ate_rmse is not None:
+            rr.log("metrics/error/ate_rmse_m", rr.Scalars(ate_rmse))
 
         # Observation count
         obs_count = len(observations) if observations else 0
@@ -383,6 +413,44 @@ class VIOVisualizer:
         )
 
         rr.log("status/pose", rr.TextDocument(text, media_type=rr.MediaType.MARKDOWN))
+
+    def _log_covariance_ellipsoid(self, pos_cov, scale=3.0):
+        """Log a 3-sigma uncertainty ellipsoid at the current pose.
+
+        Args:
+            pos_cov: 3x3 position covariance matrix.
+            scale: Number of sigma for the ellipsoid (3.0 = 99.7% confidence).
+        """
+        # Eigen-decomposition: covariance = V * diag(eigenvalues) * V^T
+        eigenvalues, eigenvectors = np.linalg.eigh(pos_cov)
+
+        # Clamp negative eigenvalues (numerical noise)
+        eigenvalues = np.maximum(eigenvalues, 1e-10)
+
+        # Half-sizes = scale * sqrt(eigenvalue) = scale * sigma along each axis
+        half_sizes = scale * np.sqrt(eigenvalues)
+
+        # Current pose position
+        pos = self.trajectory_poses[-1]
+
+        # Eigenvectors form the rotation matrix for the ellipsoid orientation
+        rot_matrix = eigenvectors  # 3x3 rotation aligning ellipsoid axes to world
+
+        # Log transform to position/orient the ellipsoid
+        rr.log(
+            "world/covariance_ellipsoid",
+            rr.Transform3D(
+                translation=pos,
+                mat3x3=rot_matrix,
+            ),
+        )
+        rr.log(
+            "world/covariance_ellipsoid/ellipsoid",
+            rr.Ellipsoids3D(
+                half_sizes=[half_sizes.tolist()],
+                colors=[[255, 165, 0, 60]],  # Orange, semi-transparent
+            ),
+        )
 
     def _to_rgb(self, img):
         """Convert image to RGB for Rerun (expects RGB)."""
