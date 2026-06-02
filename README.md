@@ -183,13 +183,20 @@ numpy, scipy, pandas
 ```
 
 ---
+## Trajectory Accuracy (ATE)
 
-## Usage
+Absolute Trajectory Error after SE(3) Umeyama alignment on **MH_01_easy** (328 frames):
 
-```bash
-cd tightly-coupled
-python main.py
-```
+> **Note:** The graph is initialized with identity SE(3) pose and zero velocity/bias — high max error reflects early convergence stages.
+
+| Metric | Value |
+|--------|-------|
+| **RMSE** | 0.886 m |
+| Mean | 0.303 m |
+| Median | 0.175 m |
+| Max | 10.189 m |
+| Std | 0.833 m |
+
 
 The Rerun viewer launches automatically. Processing logs are printed to the terminal with per-frame diagnostics including graph size, optimization error, and tracking statistics.
 
