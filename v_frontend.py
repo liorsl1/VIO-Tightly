@@ -289,7 +289,7 @@ class vFeature:
         """
         # For XFeat, use lower confidence threshold (cosine sim range differs)
         if self.matcher_type == "xfeat":
-            confidence_threshold = 0.9
+            confidence_threshold = 0.95
 
         # Preprocess images for matching
         left_tensor = self.preprocess_for_matching(left_img)

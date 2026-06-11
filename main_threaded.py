@@ -95,6 +95,38 @@ def compute_ate(est_positions, gt_positions):
     return ate_rmse, ate_errors, R_align, t_align
 
 
+def compute_rte(est_positions, gt_positions, delta=4):
+    """Compute Relative Trajectory Error (RTE) — drift per segment.
+
+    Measures the error in relative motion over segments of `delta` poses.
+    Unlike ATE (which uses global alignment), RTE captures local drift
+    and is independent of global reference frame alignment.
+
+    Args:
+        est_positions: List of estimated 3D positions.
+        gt_positions: List of ground truth 3D positions.
+        delta: Number of poses between segment start and end (default: 4).
+
+    Returns:
+        rte_rmse: RMSE of relative translation errors (meters)
+        rte_errors: Per-segment relative translation errors (N-delta,)
+    """
+    est = np.array(est_positions)
+    gt = np.array(gt_positions)
+    n = len(est)
+    if n <= delta:
+        return 0.0, np.zeros(max(n - delta, 0))
+
+    # Relative displacements over `delta` poses
+    est_deltas = est[delta:] - est[:-delta]  # (N-delta, 3)
+    gt_deltas = gt[delta:] - gt[:-delta]     # (N-delta, 3)
+
+    # Per-segment relative error
+    rte_errors = np.linalg.norm(est_deltas - gt_deltas, axis=1)
+    rte_rmse = float(np.sqrt(np.mean(rte_errors ** 2)))
+    return rte_rmse, rte_errors
+
+
 def frontend_worker(
     feature_pipeline: vFeature,
     data_manager: DataManager,
@@ -482,11 +514,12 @@ def main():
     # --- Wait for frontend to finish ---
     frontend_thread.join()
 
-    # --- Final ATE Summary ---
+    # --- Final Trajectory Error Summary ---
     if len(ate_est_positions) >= 3:
         ate_rmse, ate_errors, R_align, t_align = compute_ate(
             ate_est_positions, ate_gt_positions
         )
+        rte_rmse, rte_errors = compute_rte(ate_est_positions, ate_gt_positions)
         print("\n" + "=" * 60)
         print(f"  FINAL ATE (Absolute Trajectory Error)")
         print(f"  RMSE:    {ate_rmse:.4f} m")
@@ -495,6 +528,14 @@ def main():
         print(f"  Max:     {np.max(ate_errors):.4f} m")
         print(f"  Std:     {np.std(ate_errors):.4f} m")
         print(f"  Frames:  {len(ate_errors)}")
+        print("-" * 60)
+        print(f"  FINAL RTE (Relative Trajectory Error)")
+        print(f"  RMSE:    {rte_rmse:.4f} m")
+        print(f"  Mean:    {np.mean(rte_errors):.4f} m")
+        print(f"  Median:  {np.median(rte_errors):.4f} m")
+        print(f"  Max:     {np.max(rte_errors):.4f} m")
+        print(f"  Std:     {np.std(rte_errors):.4f} m")
+        print(f"  Segments: {len(rte_errors)}")
         print("=" * 60)
 
     # Cleanup
