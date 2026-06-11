@@ -150,7 +150,7 @@ def frontend_worker(
 
 
 def main():
-    data_dir = "f:/Code/exercise_10/data/MH_01_easy/mav0"
+    data_dir = "/home/liorsl/Self/datasets/MH_01_easy/MH_01_easy/mav0"
     if not os.path.exists(data_dir):
         print(f"Data directory {data_dir} does not exist.")
         return

@@ -141,7 +141,7 @@ class vFeature:
         # Filter based on reasonable disparity and epipolar constraint
         valid_matches = np.logical_and.reduce([
             disparity > 0,  # Positive disparity
-            disparity < 40,  # Reasonable disparity limit
+            disparity < 30,  # Reasonable disparity limit
             vertical_error < 2.0  # Tight epipolar constraint
         ])
 
@@ -262,6 +262,7 @@ class vFeature:
             desc0 = features1["descriptors"][0]  # (N, 64)
             desc1 = features2["descriptors"][0]  # (M, 64)
             # Compute similarity and find mutual nearest neighbors
+            # Could be improved with ZSSD or ZNCC
             with torch.inference_mode():
                 sim = desc0 @ desc1.T  # (N, M)
                 nn01 = sim.argmax(dim=1)  # best match in feat2 for each feat1
@@ -794,8 +795,8 @@ class vFeature:
         return np.asarray(landmark_ids)
 
     # --------------- Hook in process_stereo_frame ---------------
-    MIN_TRACKED_FEATURES = 200  # Trigger new detection when tracks drop below this
-
+    MIN_TRACKED_FEATURES = 300  # Trigger new detection when tracks drop below this
+    min_tracked_dist = 10.0
     def process_stereo_frame2(self, left_img, right_img, imu_pose=None, R_prev_curr=None):
         """Main stereo processing pipeline — KLT-first, detect only when needed.
 
@@ -837,14 +838,15 @@ class vFeature:
         new_descs = np.empty((0, self.hnsw_dim), dtype=np.float32)
         new_landmark_ids = np.empty((0,), dtype=int)
         new_landmarks_3d = {}
+        full_initial_match = 5
 
         if need_new_features:
-            is_first_frame = (self.current_frame_id == 0)
+            is_first_frame = (self.current_frame_id < full_initial_match)
             print(f"  Tracked {n_tracked} < {self.MIN_TRACKED_FEATURES}, detecting new features"
                   f" ({'INIT: full stereo match' if is_first_frame else 'KLT stereo'})...")
 
             if is_first_frame:
-                # --- FIRST FRAME: Full SuperPoint + LightGlue stereo matching ---
+                # --- FIRST FRAME: Full XFeat + cosinge similarity stereo matching ---
                 features_left, matches = self.extract_and_match(left_img, right_img)
                 if len(features_left[0]) > 0:
                     left_points = matches[0]
@@ -862,12 +864,12 @@ class vFeature:
                 sp_desc = sp_feats["descriptors"][0].cpu().numpy()
 
                 # Exclude detections too close to already-tracked features early
-                if n_tracked > 0:
-                    tree_tracked = cKDTree(tracked_keypoints)
-                    d_tracked, _ = tree_tracked.query(sp_kp)
-                    far_mask = d_tracked > 9.0
-                    sp_kp = sp_kp[far_mask]
-                    sp_desc = sp_desc[far_mask]
+                # if n_tracked > 0:
+                #     tree_tracked = cKDTree(tracked_keypoints)
+                #     d_tracked, _ = tree_tracked.query(sp_kp)
+                #     far_mask = d_tracked > self.min_tracked_dist
+                #     sp_kp = sp_kp[far_mask]
+                #     sp_desc = sp_desc[far_mask]
 
                 if len(sp_kp) == 0:
                     left_points = np.empty((0, 2), dtype=np.float32)
@@ -910,16 +912,16 @@ class vFeature:
 
                         # Exclude points too close to already-tracked features
                         # (first frame has no tracked, subsequent already filtered above)
-                        if n_tracked > 0 and is_first_frame:
-                            tree = cKDTree(tracked_keypoints)
-                            dists_t, _ = tree.query(new_kpts_candidate)
-                            far_enough = dists_t > 9.0
-                        else:
-                            far_enough = np.ones(len(new_kpts_candidate), dtype=bool)
+                        # if n_tracked > 0 and is_first_frame:
+                        #     tree = cKDTree(tracked_keypoints)
+                        #     dists_t, _ = tree.query(new_kpts_candidate)
+                        #     far_enough = dists_t > self.min_tracked_dist
+                        # else:
+                        #     far_enough = np.ones(len(new_kpts_candidate), dtype=bool)
 
-                        new_kpts_filtered = new_kpts_candidate[far_enough]
-                        new_3d_filtered = points_3d[far_enough]
-                        new_descs_filtered = new_descs_candidate[far_enough]
+                        new_kpts_filtered = new_kpts_candidate
+                        new_3d_filtered = points_3d
+                        new_descs_filtered = new_descs_candidate
 
                         if len(new_kpts_filtered) > 0:
                             # Assign new track IDs
@@ -1020,7 +1022,7 @@ class vFeature:
                     lc_descs, k=35, exclude_ids=current_lm_set, min_frame_gap=min_gap
                 )
                 candidates = self.query_similar_frames(
-                    lc_descs, k_landmarks=20, top_frames=3,
+                    lc_descs, k_landmarks=30, top_frames=3,
                     exclude_ids=current_lm_set, min_frame_gap=min_gap
                 )
                 self.lc_matched_frames = candidates

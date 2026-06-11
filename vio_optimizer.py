@@ -17,7 +17,10 @@ class GraphOptimizer:
       - Natural loop closure integration via re-observation factors
       - Robust Huber loss on reprojection errors
     """
-    def __init__(self, use_isam: bool = True, body_P_sensor: np.ndarray = None, imu_calib=None):
+
+    def __init__(
+        self, use_isam: bool = True, body_P_sensor: np.ndarray = None, imu_calib=None
+    ):
         if gtsam is None:
             self.isam = None
             self.graph = None
@@ -42,8 +45,9 @@ class GraphOptimizer:
         # self.isam_params.setOptimizationParams(dogleg_params)
         # self.isam_params.setRelinearizeThreshold(0.1)
         # self.isam_params.relinearizeSkip = 3
-        self.isam_params.setRelinearizeThreshold(0.01)
+        self.isam_params.setRelinearizeThreshold(0.05)
         self.isam_params.relinearizeSkip = 1
+        # self.isam_params.evaluateNonlinearError = True
         self.isam = gtsam.ISAM2(self.isam_params) if use_isam else None
         self.graph = gtsam.NonlinearFactorGraph()
         self.initial = gtsam.Values()
@@ -51,20 +55,21 @@ class GraphOptimizer:
 
         # --- Landmark management ---
         self.landmark_initialized = set()  # L(id) already in ISAM2 Values
-        self.landmark_obs_count = {}       # {landmark_id: number of observations added}
-        self.landmark_frozen = set()       # Landmarks frozen due to high uncertainty
+        self.landmark_obs_count = {}  # {landmark_id: number of observations added}
+        self.landmark_frozen = set()  # Landmarks frozen due to high uncertainty
         # Buffer: landmarks wait here until they have 2+ observations from different poses
         # {landmark_id: {"point_cam": np.array, "first_state": int, "observations": [(state_idx, uv), ...]}}
         self.landmark_buffer = {}
-        self.cal = None                    # gtsam.Cal3_S2, set on first observation
+        self.cal = None  # gtsam.Cal3_S2, set on first observation
 
         # Cached estimate (invalidated after each optimize call)
         self._cached_estimate = None
 
         # --- Noise models ---
-        # Prior: tight rotation (0.03 rad ≈ 1.7°), moderate translation (0.3m)
+        # Prior: tight rotation (0.03 rad ≈ 1.7°), moderate translation (0.2m)
         self.prior_pose_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([0.03, 0.03, 0.03, 0.3, 0.3, 0.3]))
+            np.array([0.03, 0.03, 0.03, 0.1, 0.1, 0.1])
+        )
         self.prior_vel_noise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
         self.prior_bias_noise = gtsam.noiseModel.Isotropic.Sigma(6, 1e-3)
         # Landmark regularization prior (sigma=1.5m).
@@ -73,10 +78,15 @@ class GraphOptimizer:
         self.landmark_regularization_noise = gtsam.noiseModel.Isotropic.Sigma(3, 1.5)
 
         # Robust pixel noise (Huber) for projection factors
-        pixel_sigma = 2.0  # pixels
+        pixel_sigma = 1.5  # pixels
         pixel_noise_base = gtsam.noiseModel.Isotropic.Sigma(2, pixel_sigma)
         self.pixel_noise = gtsam.noiseModel.Robust.Create(
-            gtsam.noiseModel.mEstimator.Huber.Create(1.345), pixel_noise_base)
+            gtsam.noiseModel.mEstimator.Huber.Create(1.345), pixel_noise_base
+        )
+
+        # Spatial distribution: grid bucketing (cell_size in pixels)
+        self.obs_cell_size = 20  # pixels — one observation per 15x15 cell per frame
+        self._frame_occupied_cells = {}  # {state_idx: set of (row, col) tuples}
 
     def _make_projection_factor(self, measurement, state_idx: int, landmark_id: int):
         """Create a projection factor with throwCheirality=False.
@@ -88,15 +98,46 @@ class GraphOptimizer:
         if self.body_P_sensor is not None:
             # Signature: (measured, noise, poseKey, pointKey, K, throwCheirality, verboseCheirality, body_P_sensor)
             return gtsam.GenericProjectionFactorCal3_S2(
-                measurement, self.pixel_noise,
-                X(state_idx), L(landmark_id),
-                self.cal, False, False, self.body_P_sensor)
+                measurement,
+                self.pixel_noise,
+                X(state_idx),
+                L(landmark_id),
+                self.cal,
+                False,
+                False,
+                self.body_P_sensor,
+            )
         else:
             # Signature: (measured, noise, poseKey, pointKey, K, throwCheirality, verboseCheirality)
             return gtsam.GenericProjectionFactorCal3_S2(
-                measurement, self.pixel_noise,
-                X(state_idx), L(landmark_id),
-                self.cal, False, False)
+                measurement,
+                self.pixel_noise,
+                X(state_idx),
+                L(landmark_id),
+                self.cal,
+                False,
+                False,
+            )
+
+    def _is_cell_available(self, state_idx: int, uv: np.ndarray) -> bool:
+        """Check if this pixel's grid cell is unoccupied for this frame.
+
+        Ensures spatial distribution of observations — at most one
+        projection factor per grid cell per pose, maximizing the
+        geometric information contributed by visual factors.
+        """
+        col = int(uv[0]) // self.obs_cell_size
+        row = int(uv[1]) // self.obs_cell_size
+        cell = (row, col)
+
+        if state_idx not in self._frame_occupied_cells:
+            self._frame_occupied_cells[state_idx] = set()
+
+        if cell in self._frame_occupied_cells[state_idx]:
+            return False
+
+        self._frame_occupied_cells[state_idx].add(cell)
+        return True
 
     # ==================== Initialization ====================
 
@@ -106,7 +147,9 @@ class GraphOptimizer:
         if isinstance(pose_wb, gtsam.Pose3):
             pose3 = pose_wb
         elif isinstance(pose_wb, np.ndarray) and pose_wb.shape == (4, 4):
-            pose3 = gtsam.Pose3(gtsam.Rot3(pose_wb[:3, :3]), gtsam.Point3(*pose_wb[:3, 3]))
+            pose3 = gtsam.Pose3(
+                gtsam.Rot3(pose_wb[:3, :3]), gtsam.Point3(*pose_wb[:3, 3])
+            )
         else:
             pose3 = gtsam.Pose3()
 
@@ -115,8 +158,14 @@ class GraphOptimizer:
         self.initial.insert(B(self.state_index), bias)
         if set_priors and self.state_index == 0:
             self.graph.add(gtsam.PriorFactorPose3(X(0), pose3, self.prior_pose_noise))
-            self.graph.add(gtsam.PriorFactorVector(V(0), gtsam.Point3(*vel_w), self.prior_vel_noise))
-            self.graph.add(gtsam.PriorFactorConstantBias(B(0), bias, self.prior_bias_noise))
+            self.graph.add(
+                gtsam.PriorFactorVector(
+                    V(0), gtsam.Point3(*vel_w), self.prior_vel_noise
+                )
+            )
+            self.graph.add(
+                gtsam.PriorFactorConstantBias(B(0), bias, self.prior_bias_noise)
+            )
 
     # ==================== IMU Factors ====================
 
@@ -132,9 +181,9 @@ class GraphOptimizer:
     def add_imu_factor(self, preint, prev_idx: int, curr_idx: int):
         if gtsam is None or preint is None:
             return
-        fac = gtsam.ImuFactor(X(prev_idx), V(prev_idx),
-                              X(curr_idx), V(curr_idx),
-                              B(prev_idx), preint)
+        fac = gtsam.ImuFactor(
+            X(prev_idx), V(prev_idx), X(curr_idx), V(curr_idx), B(prev_idx), preint
+        )
         self.graph.add(fac)
         # Bias random walk between consecutive states
         # Discrete noise = continuous RW density * sqrt(dt)
@@ -142,15 +191,22 @@ class GraphOptimizer:
         dt = preint.deltaTij()
         bias_sigmas = self.imu_calib.bias_between_sigmas(dt)
         bias_noise = gtsam.noiseModel.Diagonal.Sigmas(bias_sigmas)
-        self.graph.add(gtsam.BetweenFactorConstantBias(
-            B(prev_idx), B(curr_idx),
-            gtsam.imuBias.ConstantBias(), bias_noise))
+        self.graph.add(
+            gtsam.BetweenFactorConstantBias(
+                B(prev_idx), B(curr_idx), gtsam.imuBias.ConstantBias(), bias_noise
+            )
+        )
 
     # ==================== Visual Factors (Explicit Landmarks) ====================
 
-    def add_landmark_observation(self, landmark_id: int, state_idx: int,
-                                  uv: np.ndarray, K: np.ndarray,
-                                  landmark_3d: np.ndarray = None):
+    def add_landmark_observation(
+        self,
+        landmark_id: int,
+        state_idx: int,
+        uv: np.ndarray,
+        K: np.ndarray,
+        landmark_3d: np.ndarray = None,
+    ):
         """Add a projection factor between pose X(state_idx) and landmark L(landmark_id).
 
         Landmarks are buffered until they have observations from 2+ different poses.
@@ -179,13 +235,23 @@ class GraphOptimizer:
             # Depth check: skip if landmark is behind the camera from this pose
             if not self._is_landmark_in_front(landmark_id, state_idx):
                 return
+            # Cell check: skip if this pixel's grid cell is already occupied for this pose
+            if not self._is_cell_available(state_idx, uv):
+                return
             measurement = gtsam.Point2(float(uv[0]), float(uv[1]))
-            self.graph.add(self._make_projection_factor(measurement, state_idx, landmark_id))
-            self.landmark_obs_count[landmark_id] = self.landmark_obs_count.get(landmark_id, 0) + 1
+            self.graph.add(
+                self._make_projection_factor(measurement, state_idx, landmark_id)
+            )
+            self.landmark_obs_count[landmark_id] = (
+                self.landmark_obs_count.get(landmark_id, 0) + 1
+            )
             return
 
         # --- Case 2: Landmark in buffer — add observation and maybe promote ---
         if landmark_id in self.landmark_buffer:
+            # Cell check: ensure spatial distribution even for buffered landmarks
+            if not self._is_cell_available(state_idx, uv):
+                return
             buf = self.landmark_buffer[landmark_id]
             buf["observations"].append((state_idx, np.array(uv, dtype=float)))
             # Check if we have observations from 3+ distinct poses
@@ -197,6 +263,9 @@ class GraphOptimizer:
         # --- Case 3: First time seeing this landmark — add to buffer ---
         if landmark_3d is None:
             return  # Cannot initialize without 3D position
+        # Cell check: claim this cell for the first observation
+        if not self._is_cell_available(state_idx, uv):
+            return
         self.landmark_buffer[landmark_id] = {
             "point_cam": np.array(landmark_3d, dtype=float),
             "first_state": state_idx,
@@ -206,7 +275,7 @@ class GraphOptimizer:
     def _promote_landmark(self, landmark_id: int):
         """Move a landmark from the buffer into the factor graph (ISAM2).
 
-        Called when a buffered landmark has 2+ observations from different poses.
+        Called when a buffered landmark has 3+ observations from different poses.
         Adds the landmark variable + all buffered projection factors at once.
         Validates that the landmark is geometrically visible (positive depth) from
         all observing poses before committing — prevents indeterminate systems from
@@ -215,7 +284,7 @@ class GraphOptimizer:
         buf = self.landmark_buffer.pop(landmark_id)
         # Validate: reject landmarks with degenerate camera-frame depth
         depth = buf["point_cam"][2]
-        if depth < 0.3 or depth > 30.0:
+        if depth < 0.2 or depth > 20.0:
             # Bad triangulation — don't add to graph
             return
         # Transform landmark from camera frame to world frame using the first observing pose
@@ -234,14 +303,18 @@ class GraphOptimizer:
             if len(poses) >= 2:
                 max_baseline = max(
                     np.linalg.norm(np.array(poses[i]) - np.array(poses[j]))
-                    for i in range(len(poses)) for j in range(i+1, len(poses))
+                    for i in range(len(poses))
+                    for j in range(i + 1, len(poses))
                 )
                 if max_baseline < 0.05:  # Less than 5cm baseline → unreliable depth
+                    print(
+                        f"  Rejecting landmark due to insufficient baseline ({max_baseline:.2f}m)"
+                    )
                     return
 
         # Validate: landmark must be in front of ALL observing cameras
         pt_gtsam = gtsam.Point3(*pt3_world)
-        for (s_idx, _uv) in buf["observations"]:
+        for s_idx, _uv in buf["observations"]:
             estimate = self.get_current_estimate()
             if estimate is not None and estimate.exists(X(s_idx)):
                 world_T_body = estimate.atPose3(X(s_idx))
@@ -262,18 +335,25 @@ class GraphOptimizer:
         self.landmark_obs_count[landmark_id] = 0
 
         # Regularization prior to prevent indeterminate linear system
-        self.graph.add(gtsam.PriorFactorPoint3(
-            L(landmark_id), gtsam.Point3(*pt3_world),
-            self.landmark_regularization_noise))
+        self.graph.add(
+            gtsam.PriorFactorPoint3(
+                L(landmark_id),
+                gtsam.Point3(*pt3_world),
+                self.landmark_regularization_noise,
+            )
+        )
 
         # Add all buffered projection factors
-        for (s_idx, uv) in buf["observations"]:
+        for s_idx, uv in buf["observations"]:
             measurement = gtsam.Point2(float(uv[0]), float(uv[1]))
-            self.graph.add(self._make_projection_factor(measurement, s_idx, landmark_id))
+            self.graph.add(
+                self._make_projection_factor(measurement, s_idx, landmark_id)
+            )
             self.landmark_obs_count[landmark_id] += 1
 
-    def add_loop_closure_observation(self, landmark_id: int, state_idx: int,
-                                      uv: np.ndarray):
+    def add_loop_closure_observation(
+        self, landmark_id: int, state_idx: int, uv: np.ndarray
+    ):
         """Add a reprojection factor for a loop closure re-observation.
 
         This is for when you re-detect an existing landmark from a distant frame.
@@ -285,12 +365,20 @@ class GraphOptimizer:
             return  # Can't add factor to non-existent landmark
 
         measurement = gtsam.Point2(float(uv[0]), float(uv[1]))
-        self.graph.add(self._make_projection_factor(measurement, state_idx, landmark_id))
-        self.landmark_obs_count[landmark_id] = self.landmark_obs_count.get(landmark_id, 0) + 1
+        self.graph.add(
+            self._make_projection_factor(measurement, state_idx, landmark_id)
+        )
+        self.landmark_obs_count[landmark_id] = (
+            self.landmark_obs_count.get(landmark_id, 0) + 1
+        )
 
-    def add_loop_closure_pose_constraint(self, current_idx: int, matched_idx: int,
-                                          relative_pose,
-                                          noise_sigmas: np.ndarray = None):
+    def add_loop_closure_pose_constraint(
+        self,
+        current_idx: int,
+        matched_idx: int,
+        relative_pose,
+        noise_sigmas: np.ndarray = None,
+    ):
         """Add a BetweenFactor<Pose3> for loop closure between two frames.
 
         This provides a strong 6-DOF constraint that can correct accumulated drift,
@@ -307,10 +395,13 @@ class GraphOptimizer:
         if gtsam is None:
             return
         if noise_sigmas is None:
-            noise_sigmas = np.array([0.05, 0.05, 0.05, 0.15, 0.15, 0.15])
+            noise_sigmas = np.array([0.05, 0.05, 0.05, 0.2, 0.2, 0.2])
         noise_model = gtsam.noiseModel.Diagonal.Sigmas(noise_sigmas)
-        self.graph.add(gtsam.BetweenFactorPose3(
-            X(matched_idx), X(current_idx), relative_pose, noise_model))
+        self.graph.add(
+            gtsam.BetweenFactorPose3(
+                X(matched_idx), X(current_idx), relative_pose, noise_model
+            )
+        )
 
     def _is_landmark_in_front(self, landmark_id: int, state_idx: int) -> bool:
         """Check if a landmark has positive depth from the given pose's camera.
@@ -376,11 +467,20 @@ class GraphOptimizer:
         self._cached_estimate = None  # Invalidate cache
         if self.isam is not None:
             try:
-                self.isam.update(self.graph, self.initial)
+                update_result = self.isam.update(self.graph, self.initial)
+                # error_diff = (
+                #     update_result.getErrorAfter() - update_result.getErrorBefore()
+                # )
+                # print(f"ISAM2 error change after update: {error_diff:.3f}, ")
                 self.graph.resize(0)
                 self.initial.clear()
                 # One extra iteration helps convergence
-                self.isam.update()
+
+                if (
+                    update_result.getVariablesRelinearized() > 8
+                    # or abs(error_diff) > 1.0
+                ):
+                    self.isam.update()
             except RuntimeError as e:
                 if "Indeterminant" in str(e) or "indeterminant" in str(e):
                     # Graceful recovery: discard this batch and continue
@@ -429,9 +529,11 @@ class GraphOptimizer:
         n_landmarks = len(self.landmark_initialized)
         n_buffered = len(self.landmark_buffer)
         n_total_obs = sum(self.landmark_obs_count.values())
-        return (f"States: {self.state_index+1}, Landmarks: {n_landmarks} "
-                f"(+{n_buffered} buffered), "
-                f"Observations: {n_total_obs}, Factors(pending): {self.graph.size()}")
+        return (
+            f"States: {self.state_index+1}, Landmarks: {n_landmarks} "
+            f"(+{n_buffered} buffered), "
+            f"Observations: {n_total_obs}, Factors(pending): {self.graph.size()}"
+        )
 
     def diagnostics(self):
         """Return optimization quality metrics."""
@@ -485,8 +587,10 @@ class GraphOptimizer:
                 newly_frozen += 1
 
         if newly_frozen > 0:
-            print(f"  Froze {newly_frozen} high-uncertainty landmarks "
-                  f"(total frozen: {len(self.landmark_frozen)}/{len(self.landmark_initialized)})")
+            print(
+                f"  Froze {newly_frozen} high-uncertainty landmarks "
+                f"(total frozen: {len(self.landmark_frozen)}/{len(self.landmark_initialized)})"
+            )
         return newly_frozen
 
     # ==================== Covariance & Degeneracy ====================
@@ -522,12 +626,12 @@ class GraphOptimizer:
             'motion_type': string description
         """
         result = {
-            'position_eigenvalues': None,
-            'position_eigenvectors': None,
-            'condition_number': 1.0,
-            'degenerate': False,
-            'degenerate_direction': None,
-            'motion_type': 'normal',
+            "position_eigenvalues": None,
+            "position_eigenvectors": None,
+            "condition_number": 1.0,
+            "degenerate": False,
+            "degenerate_direction": None,
+            "motion_type": "normal",
         }
 
         pos_cov = self.get_position_covariance(state_idx)
@@ -535,31 +639,33 @@ class GraphOptimizer:
             return result
 
         eigenvalues, eigenvectors = np.linalg.eigh(pos_cov)
-        result['position_eigenvalues'] = eigenvalues
-        result['position_eigenvectors'] = eigenvectors
+        result["position_eigenvalues"] = eigenvalues
+        result["position_eigenvectors"] = eigenvectors
 
         min_eig = max(eigenvalues[0], 1e-12)
         max_eig = eigenvalues[-1]
         condition_number = max_eig / min_eig
-        result['condition_number'] = condition_number
-        result['degenerate_direction'] = eigenvectors[:, -1]
+        result["condition_number"] = condition_number
+        result["degenerate_direction"] = eigenvectors[:, -1]
 
         CONDITION_THRESHOLD = 100.0
         LARGE_UNCERTAINTY_M2 = 1.0
 
         if condition_number > CONDITION_THRESHOLD:
-            result['degenerate'] = True
+            result["degenerate"] = True
             worst_dir = eigenvectors[:, -1]
             if abs(worst_dir[2]) > 0.8:
-                result['motion_type'] = 'vertical_degeneracy (scale/gravity unobservable)'
+                result["motion_type"] = (
+                    "vertical_degeneracy (scale/gravity unobservable)"
+                )
             else:
-                result['motion_type'] = 'lateral_degeneracy (insufficient parallax)'
+                result["motion_type"] = "lateral_degeneracy (insufficient parallax)"
         elif max_eig > LARGE_UNCERTAINTY_M2:
-            result['degenerate'] = True
-            result['motion_type'] = 'high_overall_uncertainty'
+            result["degenerate"] = True
+            result["motion_type"] = "high_overall_uncertainty"
 
         if all(e > 0.5 for e in eigenvalues):
-            result['degenerate'] = True
-            result['motion_type'] = 'pure_rotation (no translational motion observed)'
+            result["degenerate"] = True
+            result["motion_type"] = "pure_rotation (no translational motion observed)"
 
         return result
