@@ -14,7 +14,7 @@ class vFeature:
     def __init__(self, matcher_type="superpoint", device="cpu", baseline=None, 
                  intrinsics=None, dist_coeffs=None, T_cam1_cam0=None, max_features=2048):
         # --- Existing attributes ---
-        self.matcher_type = matcher_type
+        self.matcher_type = matcher_type  # "superpoint" or "xfeat"
         self.device = device
         self.baseline = baseline
         self.intrinsics = intrinsics
@@ -47,7 +47,7 @@ class vFeature:
         
         # --- HNSW retrieval structures ---
         self.hnsw_index = None
-        self.hnsw_dim = 256          # SuperPoint descriptor dimension
+        self.hnsw_dim = 256 if matcher_type == "superpoint" else 64  # SuperPoint=256D, XFeat=64D
         self.hnsw_max_elements = 200000
         self.hnsw_elements = 0
         self.hnsw_inited = False
@@ -63,11 +63,20 @@ class vFeature:
         self.initialize()
 
     def initialize(self):
-        """Initialize feature extractors and matchers (keep existing implementation)"""
+        """Initialize feature extractors and matchers."""
         
-        print("Initializing SuperPoint and LightGlue...")
-        self.superpoint = SuperPoint(max_num_keypoints=1024).eval().to(self.device)
-        self.lg_matcher = LightGlue(features="superpoint").eval().to(self.device)
+        if self.matcher_type == "xfeat":
+            import torch as _torch
+            print("Initializing XFeat...")
+            self.xfeat = _torch.hub.load(
+                'verlab/accelerated_features', 'XFeat',
+                pretrained=True, top_k=1024, trust_repo=True
+            ).eval().to(self.device)
+            print(f"XFeat loaded on {self.device} (64D descriptors)")
+        else:
+            print("Initializing SuperPoint and LightGlue...")
+            self.superpoint = SuperPoint(max_num_keypoints=1024).eval().to(self.device)
+            self.lg_matcher = LightGlue(features="superpoint").eval().to(self.device)
 
         if self.intrinsics is not None:
             if isinstance(self.intrinsics, (list, tuple)):
@@ -133,7 +142,7 @@ class vFeature:
         valid_matches = np.logical_and.reduce([
             disparity > 0,  # Positive disparity
             disparity < 40,  # Reasonable disparity limit
-            vertical_error < 2.5  # Tight epipolar constraint
+            vertical_error < 2.0  # Tight epipolar constraint
         ])
 
         return valid_matches
@@ -179,84 +188,21 @@ class vFeature:
         return matched_img
 
     # ==================== CORE TIGHTLY-COUPLED FUNCTIONS ====================
-    
-    # def process_stereo_frame(self, left_img, right_img, imu_pose=None):
-    #     """
-    #     Main processing function for tightly-coupled SLAM.
-        
-    #     Args:
-    #         left_img: Left stereo image
-    #         right_img: Right stereo image  
-    #         imu_pose: Current IMU pose estimate (4x4 matrix)
-            
-    #     Returns:
-    #         observations: List of feature observations for optimization
-    #         new_landmarks: List of newly triangulated landmarks
-    #     """
-    #     # 1. Extract features from left image
-    #     # 3. Track features from previous frame
-    #     # 2. Perform stereo matching for depth
-    #     # 4. Triangulate new landmarks
-    #     # 5. Update feature tracks
-    #     # 6. Return observations for optimization
-    #     observations = []
-    #     tracked_ids = []
-    #     features_left, matches = self.extract_and_match(left_img, right_img)
-    #     if len(features_left) == 0:
-    #         return [], []
-    #     left_points = matches[0]
-    #     right_points = matches[1]
-    #     matches = matches[2]
-    #     # 2. Perform stereo matching for depth
-    #     # And filter matches based on epipolar constraint
-    #     valid_matches = self.stereo_match_rectified(left_points, right_points)
-    #     if len(valid_matches.nonzero()[0]) == 0:
-    #         return [], []
-    #     # visualize matches over left right images
-    #     left_points_valid = left_points[valid_matches]
-    #     right_points_valid = right_points[valid_matches]
-    #     # matched_img = self.visualize_stereo_matches(left_img, right_img, left_points_valid, right_points_valid)
-    #     # cv2.imshow("Stereo Matches", matched_img)
-    #     # cv2.waitKey(0)
-    #     # 4. Triangulate new landmarks
-    #     # 3. Track features from previous frame
-    #     if self.prev_keypoints is not None:
-    #         tracked_ids = self.track_features_temporal(
-    #             self.prev_frame, left_img, self.prev_keypoints
-    #         )
-    #         if self.prev_track_ids is not None:
-    #             tracked_ids = self.prev_track_ids[tracked_ids]
-
-    #     points_3d, valid_mask = self.stereo_triangulation(left_points_valid, right_points_valid, imu_pose)
-        
-    #     # get valid points after reprojection error filtering
-    #     valid_curr_keypts = left_points_valid[valid_mask]
-
-    #     if len(points_3d) == 0:
-    #         return [], []
-        
-            
-    #         # 5. Update feature tracks
-    #         track_ids = self.manage_landmarks(points_3d, tracked_ids, self.current_frame_id)
-    #         # 6. Create observations for optimization
-    #         observations = self.create_observations_for_optimization(features_left, track_ids, self.current_frame_id)
-        
-    #     # 7. Update previous frame state
-    #     self.prev_keypoints = valid_curr_keypts
-    #     #self.prev_descriptors = current_descriptors
-    #     self.prev_frame = left_img.copy()
-    #     self.current_frame_id += 1
-    #     # 8. Return observations and new landmarks
-    #     new_landmarks = points_3d
-    #     return observations, new_landmarks
 
     def preprocess_for_matching(self, img):
         """
         Preprocess image for feature matching.
+        For 'xfeat': expects (H, W) grayscale or (H, W, 3) RGB, output (1, 3, H, W).
         For 'disk': expects (H, W, 3) RGB, normalized to [0,1], shape (1, 3, H, W).
         For 'loftr' and 'superpoint': expects (H, W) grayscale, normalized to [0,1], shape (1, 1, H, W).
         """
-        if self.matcher_type == "disk":
+        if self.matcher_type == "xfeat":
+            # XFeat expects (B, 3, H, W) RGB float [0,1]
+            if img.ndim == 2:
+                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+            img = img.astype("float32") / 255.0
+            img_tensor = torch.from_numpy(img).permute(2, 0, 1)[None]  # (1, 3, H, W)
+        elif self.matcher_type == "disk":
             if img.ndim == 2:  # grayscale
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
             img = img.astype("float32") / 255.0
@@ -271,7 +217,9 @@ class vFeature:
 
     def extract_features(self, image, num_features=2048):
         """Extract features from an image using the selected model."""
-        if self.matcher_type == "disk":
+        if self.matcher_type == "xfeat":
+            return self._extract_features_xfeat(image)
+        elif self.matcher_type == "disk":
             return self._extract_features_disk(image, num_features)
         elif self.matcher_type == "superpoint":
             return self._extract_features_superpoint(image)
@@ -279,6 +227,17 @@ class vFeature:
             raise NotImplementedError(
                 "Feature extraction not implemented for this matcher_type."
             )
+
+    def _extract_features_xfeat(self, image):
+        """Extract features using XFeat. Returns dict compatible with SuperPoint format."""
+        with torch.inference_mode():
+            output = self.xfeat.detectAndCompute(image, top_k=2048)[0]
+        # Return in same format as SuperPoint for compatibility
+        return {
+            "keypoints": [output["keypoints"]],      # list of (N, 2)
+            "descriptors": [output["descriptors"]],  # list of (N, 64)
+            "scores": [output["scores"]],            # list of (N,)
+        }
 
     def _extract_features_disk(self, image, num_features):
         with torch.inference_mode():
@@ -297,8 +256,26 @@ class vFeature:
         return features
 
     def match_features(self, features1, features2, img_shape1, img_shape2, device):
-        """Compute tentative matches between features using LightGlueMatcher."""
-        if self.matcher_type == "superpoint":
+        """Compute tentative matches between features."""
+        if self.matcher_type == "xfeat":
+            # Use mutual nearest neighbor matching on descriptors
+            desc0 = features1["descriptors"][0]  # (N, 64)
+            desc1 = features2["descriptors"][0]  # (M, 64)
+            # Compute similarity and find mutual nearest neighbors
+            with torch.inference_mode():
+                sim = desc0 @ desc1.T  # (N, M)
+                nn01 = sim.argmax(dim=1)  # best match in feat2 for each feat1
+                nn10 = sim.argmax(dim=0)  # best match in feat1 for each feat2
+                ids0 = torch.arange(len(desc0), device=sim.device)
+                mutual = nn10[nn01] == ids0  # mutual nearest neighbor check
+                # Build match indices like LightGlue format
+                valid_ids0 = ids0[mutual]
+                valid_ids1 = nn01[mutual]
+                matches01 = torch.stack([valid_ids0, valid_ids1], dim=1)
+                # Score = cosine similarity of matched pairs
+                scores = sim[valid_ids0, valid_ids1]
+            return matches01, scores, features1
+        elif self.matcher_type == "superpoint":
             with torch.inference_mode():
                 matches = self.lg_matcher({"image0": features1, "image1": features2})
             matches01 = matches["matches"][0]
@@ -309,6 +286,10 @@ class vFeature:
         """
         Extract features from left and right images, then match them.
         """
+        # For XFeat, use lower confidence threshold (cosine sim range differs)
+        if self.matcher_type == "xfeat":
+            confidence_threshold = 0.9
+
         # Preprocess images for matching
         left_tensor = self.preprocess_for_matching(left_img)
         right_tensor = self.preprocess_for_matching(right_img)
@@ -415,6 +396,9 @@ class vFeature:
             print(f"Filtered {(~valid).sum()}/{len(points_3d)} points with reprojection error and depth constraints.")
             print(f"Left reproj mean error: {reproj_error_left[valid].mean():.2f}px, "
                 f"Right reproj mean error: {reproj_error_right[valid].mean():.2f}px")
+        else:
+            print(f"* All points filtered out! Left reproj error: {reproj_error_left.mean():.2f}px, "
+                  f"Right reproj error: {reproj_error_right.mean():.2f}px *")
 
         return valid
 
@@ -459,49 +443,6 @@ class vFeature:
         
         return landmark_ids
 
-    def create_observations_for_optimization(self, keypoints, track_ids, frame_id):
-        """
-        Create feature observation data structure for optimization backend.
-        
-        Args:
-            keypoints: 2D keypoints in current frame
-            track_ids: Track IDs of the keypoints
-            frame_id: Current frame ID
-            
-        Returns:
-            observations: List of observations in format expected by optimizer
-                         [(landmark_id, frame_id, pixel_coords, uncertainty), ...]
-        """
-        # 1. Map track IDs to landmark IDs
-        # 2. Create observation tuples
-        # 3. Estimate pixel-level uncertainty
-        # 4. Filter outliers and low-quality observations
-        pass
-
-    def get_landmarks_for_optimization(self):
-        """
-        Get landmark data for optimization backend.
-        
-        Returns:
-            landmarks: Dictionary {landmark_id: (3d_position, uncertainty)}
-            observations: List of all observations for current optimization window
-        """
-        # 1. Return current landmark estimates
-        # 2. Include uncertainty/covariance estimates
-        # 3. Filter landmarks with insufficient observations
-        pass
-
-    def update_landmarks_from_optimization(self, optimized_landmarks):
-        """
-        Update landmark positions after optimization.
-        
-        Args:
-            optimized_landmarks: Dictionary {landmark_id: optimized_3d_position}
-        """
-        # 1. Update landmark positions
-        # 2. Update landmark uncertainties if provided
-        # 3. Remove outlier landmarks based on optimization results
-        pass
 
     def track_features_temporal(self, prev_frame, curr_frame, prev_keypoints, R_prev_curr=None):
         """
@@ -574,152 +515,16 @@ class vFeature:
         return valid, curr_keypoints[valid]
         
 
-    def stereo_matching_for_depth(self, left_features, right_img):
-        """
-        Find stereo correspondences for depth estimation.
-        
-        Args:
-            left_features: Features detected in left image
-            right_img: Right stereo image
-            
-        Returns:
-            stereo_matches: Correspondences between left and right images
-            disparities: Computed disparities for depth calculation
-        """
-        # 1. Extract features from right image
-        # 2. Match left-right using epipolar constraints
-        # 3. Compute disparities and filter outliers
-        pass
-
-    def landmark_culling(self, max_landmarks=5000):
-        """
-        Remove old or low-quality landmarks to maintain performance.
-        
-        Args:
-            max_landmarks: Maximum number of landmarks to maintain
-        """
-        # 1. Score landmarks based on observation count, age, reprojection error
-        # 2. Remove lowest-scoring landmarks
-        # 3. Update observation database
-        pass
 
     def get_map_for_visualization(self):
         """
-        Get current map state for visualization.
-        
-        Returns:
-            landmark_positions: Array of 3D landmark positions
-            feature_tracks: Current active feature tracks
-            map_statistics: Statistics about map quality
+        Future : create another 3D representation for the visualization
         """
-        # 1. Return all landmark positions
-        # 2. Include track information for visualization
-        # 3. Provide map quality metrics
         pass
 
-    def reproject_landmarks(self, landmarks, camera_pose, K):
-        """
-        Reproject 3D landmarks to image coordinates for validation.
-        
-        Args:
-            landmarks: 3D landmark positions
-            camera_pose: Camera pose (4x4 matrix)
-            K: Camera intrinsics
-            
-        Returns:
-            projected_points: 2D projected coordinates
-            visibility_mask: Which landmarks are visible
-        """
-        # 1. Transform landmarks to camera coordinate system
-        # 2. Project using camera model
-        # 3. Check visibility (within image bounds, positive depth)
-        pass
-
-    def estimate_feature_uncertainty(self, keypoint, descriptor_quality=None):
-        """
-        Estimate uncertainty for feature observations.
-        
-        Args:
-            keypoint: 2D keypoint location
-            descriptor_quality: Quality metric from feature detector
-            
-        Returns:
-            uncertainty: 2x2 covariance matrix for pixel coordinates
-        """
-        # 1. Base uncertainty on detector confidence
-        # 2. Consider image gradients and corner strength
-        # 3. Account for matching quality and track length
-        pass
-
-    # ==================== INTEGRATION FUNCTIONS ====================
-    
-    def initialize_from_stereo(self, left_img, right_img):
-        """
-        Initialize the mapping system from first stereo pair.
-        
-        Args:
-            left_img: First left image
-            right_img: First right image
-            
-        Returns:
-            initial_landmarks: Initial set of triangulated landmarks
-        """
-        # 1. Extract features from both images
-        # 2. Perform stereo matching
-        # 3. Triangulate initial landmarks
-        # 4. Initialize feature tracks
-        pass
-
-    def get_features_for_pose_estimation(self, min_matches=20):
-        """
-        Get feature correspondences for IMU pose refinement.
-        
-        Args:
-            min_matches: Minimum number of matches required
-            
-        Returns:
-            landmarks_3d: 3D landmark positions
-            pixels_2d: Corresponding 2D observations
-            track_ids: Track identifiers for outlier handling
-        """
-        # 1. Get landmarks visible in current frame
-        # 2. Find 2D-3D correspondences
-        # 3. Filter based on track quality and age
-        pass
-
-    def handle_optimization_outliers(self, outlier_track_ids):
-        """
-        Handle features marked as outliers by optimization.
-        
-        Args:
-            outlier_track_ids: Track IDs marked as outliers
-        """
-        # 1. Remove outlier observations
-        # 2. Terminate tracks if too many outliers
-        # 3. Update landmark quality scores
-        pass
 
     # ==================== UTILITY FUNCTIONS (Keep existing) ====================
     
-    def preprocess_for_matching(self, img):
-        """
-        Preprocess image for feature matching.
-        For 'disk': expects (H, W, 3) RGB, normalized to [0,1], shape (1, 3, H, W).
-        For 'loftr' and 'superpoint': expects (H, W) grayscale, normalized to [0,1], shape (1, 1, H, W).
-        """
-        if self.matcher_type == "disk":
-            if img.ndim == 2:  # grayscale
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-            img = img.astype("float32") / 255.0
-            img_tensor = torch.from_numpy(img).permute(2, 0, 1)[None]  # (1, 3, H, W)
-        elif self.matcher_type in ["loftr", "superpoint"]:
-            img = img.astype("float32") / 255.0
-            img_tensor = torch.from_numpy(img)[None, None]  # (1, 1, H, W)
-        else:
-            raise ValueError("Unknown matcher_type for preprocessing.")
-        img_tensor = img_tensor.to(self.device)
-        return img_tensor
-
     def set_alignment_matrix(self, R_align):
         """Set the alignment matrix for transforming poses to gravity-aligned frame."""
         self.R_align = R_align
@@ -989,9 +794,21 @@ class vFeature:
         return np.asarray(landmark_ids)
 
     # --------------- Hook in process_stereo_frame ---------------
+    MIN_TRACKED_FEATURES = 200  # Trigger new detection when tracks drop below this
+
     def process_stereo_frame2(self, left_img, right_img, imu_pose=None, R_prev_curr=None):
-        """Main stereo processing pipeline with temporal tracking and landmark management.
-        
+        """Main stereo processing pipeline — KLT-first, detect only when needed.
+
+        Per-frame (cheap, ~5-15ms):
+            1. KLT track existing features prev→curr
+            2. Output 2D observations for tracked landmarks
+
+        When tracked count < MIN_TRACKED_FEATURES (expensive, occasional):
+            3. SuperPoint detection on left image
+            4. LightGlue stereo match with right image (new features only)
+            5. Triangulate new landmarks
+            6. Add to tracking pool
+
         Args:
             left_img: Left stereo image (grayscale).
             right_img: Right stereo image (grayscale).
@@ -999,126 +816,231 @@ class vFeature:
             R_prev_curr: Optional 3x3 rotation from previous to current camera frame
                          (from IMU preintegration). Improves optical flow tracking.
         """
-        observations = []
-        tracked_ids = []
-        
-        # ========== 1. STEREO FEATURE EXTRACTION & MATCHING ==========
-        # Extract SuperPoint features and match between left/right images
-        features_left, matches = self.extract_and_match(left_img, right_img)
-        if len(features_left) == 0:
-            return [], []
-        left_points = matches[0]; right_points = matches[1]
-        
-        # Filter matches using epipolar constraints (rectified stereo)
-        valid_matches = self.stereo_match_rectified(left_points, right_points)
-        if valid_matches.sum() == 0:
-            return [], []
-        left_points_valid = left_points[valid_matches]
-        right_points_valid = right_points[valid_matches]
-        valid_descs = features_left[1][valid_matches]  # Descriptors aligned with valid matches
+        # ========== 1. TEMPORAL TRACKING (KLT) ==========
+        # Track existing features from previous frame to current frame
+        tracked_keypoints = np.empty((0, 2), dtype=np.float32)
+        tracked_landmark_ids = np.empty((0,), dtype=int)
 
-        # ========== 2. TEMPORAL TRACKING (OPTICAL FLOW) ==========
-        # Track features from previous frame to current frame using KLT
-        if self.prev_keypoints is not None:
-            valid_prev_mask, curr_tracked_keypoints = self.track_features_temporal(
+        if self.prev_keypoints is not None and len(self.prev_keypoints) > 0:
+            valid_mask, curr_tracked = self.track_features_temporal(
                 self.prev_frame, left_img, self.prev_keypoints, R_prev_curr=R_prev_curr
             )
-            if self.prev_track_ids is not None:
-                tracked_ids_prev = self.prev_track_ids[valid_prev_mask]
-        else:
-            curr_tracked_keypoints = np.empty((0, 2), dtype=np.float32)
-            tracked_ids_prev = np.empty((0,), dtype=int)
+            tracked_keypoints = curr_tracked
+            tracked_landmark_ids = self.prev_track_ids[valid_mask]
+        
+        n_tracked = len(tracked_keypoints)
+        need_new_features = n_tracked < self.MIN_TRACKED_FEATURES
 
-        # ========== 3. STEREO TRIANGULATION ==========
-        # Triangulate 3D points from valid stereo matches and filter by reprojection error
-        points_3d, valid_mask = self.stereo_triangulation(left_points_valid, right_points_valid, imu_pose)
-        if len(points_3d) == 0:
-            return [], []
-        valid_curr_keypts = left_points_valid[valid_mask]
-        valid_descs = valid_descs[valid_mask]
+        # ========== 2. DETECT & STEREO MATCH NEW FEATURES (only when needed) ==========
+        new_keypoints = np.empty((0, 2), dtype=np.float32)
+        new_points_3d = np.empty((0, 3), dtype=np.float64)
+        new_descs = np.empty((0, self.hnsw_dim), dtype=np.float32)
+        new_landmark_ids = np.empty((0,), dtype=int)
+        new_landmarks_3d = {}
 
-        # ========== 4. TRACK ID ASSOCIATION ==========
-        # Associate tracked keypoints with triangulated keypoints to preserve track IDs
-        assoc_ids = np.full(len(valid_curr_keypts), -1, dtype=int)
-        if len(curr_tracked_keypoints) and len(valid_curr_keypts):
-            # Find nearest neighbors between tracked and triangulated keypoints
-            idxs, dists, valid = self._build_kdtree(curr_tracked_keypoints, valid_curr_keypts, radius = 5)
-            print("Prev to Current temporal tracked, to current stereo triangulated. mean dist:", float(dists[valid].mean()) if valid.any() else None,
-              "valid", valid.sum(), "/", len(valid_curr_keypts))
-            
-            good = idxs < len(valid_curr_keypts)
-            valid_landmarks_track = idxs[good]
-            # Assign existing track IDs to associated triangulated keypoints
-            for t_idx, tri_i in zip(np.where(good)[0], valid_landmarks_track):
-                if assoc_ids[tri_i] == -1:  # first assignment wins
-                    assoc_ids[tri_i] = tracked_ids_prev[t_idx]
-            final_descs = valid_descs[valid_landmarks_track]
-        else:
-            final_descs = valid_descs
-    
-        # Assign new track IDs to unassociated triangulated keypoints
-        need_new = assoc_ids == -1
-        n_new = need_new.sum()
-        if n_new:
-            new_ids = np.arange(self.next_track_id, self.next_track_id + n_new, dtype=int)
-            self.next_track_id += n_new
-            assoc_ids[need_new] = new_ids
-        track_ids = assoc_ids
+        if need_new_features:
+            is_first_frame = (self.current_frame_id == 0)
+            print(f"  Tracked {n_tracked} < {self.MIN_TRACKED_FEATURES}, detecting new features"
+                  f" ({'INIT: full stereo match' if is_first_frame else 'KLT stereo'})...")
 
-        # ========== 5. LANDMARK MANAGEMENT ==========
-        # Create new landmarks or update existing ones using track IDs
-        landmark_ids = self.manage_landmarks(points_3d, track_ids, self.current_frame_id)
+            if is_first_frame:
+                # --- FIRST FRAME: Full SuperPoint + LightGlue stereo matching ---
+                features_left, matches = self.extract_and_match(left_img, right_img)
+                if len(features_left[0]) > 0:
+                    left_points = matches[0]
+                    right_points = matches[1]
+                    descs_all = features_left[1]
+                else:
+                    left_points = np.empty((0, 2), dtype=np.float32)
+                    right_points = np.empty((0, 2), dtype=np.float32)
+                    descs_all = np.empty((0, self.hnsw_dim), dtype=np.float32)
+            else:
+                # --- SUBSEQUENT FRAMES: SuperPoint left only + KLT left→right ---
+                left_tensor = self.preprocess_for_matching(left_img)
+                sp_feats = self.extract_features(left_tensor)
+                sp_kp = sp_feats["keypoints"][0].cpu().numpy().astype(np.float32)
+                sp_desc = sp_feats["descriptors"][0].cpu().numpy()
 
-        # ========== 6. DESCRIPTOR & HNSW UPDATE ==========
-        # Update landmark descriptors for loop closure detection (periodic)
-        # Only index temporally tracked landmarks (verified multi-frame consistency)
-        if self.prev_keypoints is not None and self.current_frame_id % 5 == 0:
-            landmark_relevant = landmark_ids[valid_landmarks_track]
-            for lid, d in zip(landmark_relevant, final_descs):
+                # Exclude detections too close to already-tracked features early
+                if n_tracked > 0:
+                    tree_tracked = cKDTree(tracked_keypoints)
+                    d_tracked, _ = tree_tracked.query(sp_kp)
+                    far_mask = d_tracked > 9.0
+                    sp_kp = sp_kp[far_mask]
+                    sp_desc = sp_desc[far_mask]
+
+                if len(sp_kp) == 0:
+                    left_points = np.empty((0, 2), dtype=np.float32)
+                    right_points = np.empty((0, 2), dtype=np.float32)
+                    descs_all = np.empty((0, self.hnsw_dim), dtype=np.float32)
+                else:
+                    # KLT from left → right image (stereo matching via optical flow)
+                    lk_params_stereo = dict(
+                        winSize=(21, 5),  # Wide horizontal, narrow vertical (rectified)
+                        maxLevel=3,
+                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+                    )
+                    sp_kp_cv = sp_kp.reshape(-1, 1, 2)
+                    right_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                        left_img, right_img, sp_kp_cv, None, **lk_params_stereo
+                    )
+                    right_pts = right_pts.reshape(-1, 2)
+                    status = status.flatten() == 1
+
+                    left_points = sp_kp[status]
+                    right_points = right_pts[status]
+                    descs_all = sp_desc[status]
+
+            # --- Common path: epipolar filter + triangulate ---
+            if len(left_points) > 0:
+                valid_stereo = self.stereo_match_rectified(left_points, right_points)
+                if hasattr(valid_stereo, 'sum') and valid_stereo.sum() > 0:
+                    left_valid = left_points[valid_stereo]
+                    right_valid = right_points[valid_stereo]
+                    descs_valid = descs_all[valid_stereo]
+
+                    # Triangulate
+                    points_3d, tri_mask = self.stereo_triangulation(
+                        left_valid, right_valid, imu_pose
+                    )
+
+                    if len(points_3d) > 0:
+                        new_kpts_candidate = left_valid[tri_mask]
+                        new_descs_candidate = descs_valid[tri_mask]
+
+                        # Exclude points too close to already-tracked features
+                        # (first frame has no tracked, subsequent already filtered above)
+                        if n_tracked > 0 and is_first_frame:
+                            tree = cKDTree(tracked_keypoints)
+                            dists_t, _ = tree.query(new_kpts_candidate)
+                            far_enough = dists_t > 9.0
+                        else:
+                            far_enough = np.ones(len(new_kpts_candidate), dtype=bool)
+
+                        new_kpts_filtered = new_kpts_candidate[far_enough]
+                        new_3d_filtered = points_3d[far_enough]
+                        new_descs_filtered = new_descs_candidate[far_enough]
+
+                        if len(new_kpts_filtered) > 0:
+                            # Assign new track IDs
+                            n_new = len(new_kpts_filtered)
+                            new_ids = np.arange(
+                                self.next_track_id, self.next_track_id + n_new, dtype=int
+                            )
+                            self.next_track_id += n_new
+
+                            # Create landmarks
+                            lm_ids = self.manage_landmarks(
+                                new_3d_filtered, new_ids, self.current_frame_id
+                            )
+
+                            new_keypoints = new_kpts_filtered
+                            new_points_3d = new_3d_filtered
+                            new_descs = new_descs_filtered
+                            new_landmark_ids = lm_ids
+
+                            # Record new landmarks for optimizer
+                            for idx, lid in enumerate(lm_ids):
+                                new_landmarks_3d[int(lid)] = new_3d_filtered[idx]
+
+                            print(f"  Added {n_new} new features (total will be {n_tracked + n_new})")
+
+        # ========== 3. UPDATE LANDMARK LAST-SEEN FOR TRACKED ==========
+        for lid in tracked_landmark_ids:
+            self.landmark_last_frame[int(lid)] = self.current_frame_id
+
+        # ========== 4. OBSERVATIONS OUTPUT FOR OPTIMIZER ==========
+        # All tracked features produce observations (no re-triangulation needed)
+        observations = []
+        for idx, lid in enumerate(tracked_landmark_ids):
+            uv = tracked_keypoints[idx]
+            observations.append((int(lid), self.current_frame_id, uv.astype(np.float32)))
+
+        # New features also produce observations
+        for idx, lid in enumerate(new_landmark_ids):
+            uv = new_keypoints[idx]
+            observations.append((int(lid), self.current_frame_id, uv.astype(np.float32)))
+
+        # ========== 5. DESCRIPTOR & HNSW UPDATE (periodic) ==========
+        # Periodically extract descriptors for TRACKED landmarks too (not just new ones)
+        # This enables loop closure to find revisited landmarks
+        if self.current_frame_id % 5 == 0 and n_tracked > 0:
+            # Run SuperPoint extraction only (no LightGlue stereo match — cheap ~30ms)
+            left_tensor = self.preprocess_for_matching(left_img)
+            sp_feats = self.extract_features(left_tensor)
+            sp_kp = sp_feats["keypoints"][0].cpu().numpy()
+            sp_desc = sp_feats["descriptors"][0].cpu().numpy()
+
+            # Map tracked keypoints to nearest SuperPoint detections for descriptors
+            idxs, dists, valid_sp = self._build_kdtree(tracked_keypoints, sp_kp, radius=3.0)
+            matched_lids = tracked_landmark_ids[valid_sp]
+            matched_descs = sp_desc[idxs[valid_sp]]
+
+            for lid, d in zip(matched_lids, matched_descs):
+                if d.sum() != 0.0:
+                    self._update_landmark_descriptor(int(lid), d)
+                    self._buffer_new_landmark(int(lid))
+
+            # Also index new features if we have them
+            if len(new_descs) > 0:
+                for lid, d in zip(new_landmark_ids, new_descs):
+                    if d.sum() != 0.0:
+                        self._update_landmark_descriptor(int(lid), d)
+                        self._buffer_new_landmark(int(lid))
+
+            self._flush_hnsw_buffer(batch_size=512)
+            print(f"  HNSW update: indexed {valid_sp.sum()} tracked + {len(new_descs)} new descriptors")
+        elif self.current_frame_id % 5 == 0 and len(new_descs) > 0:
+            # Only new features available (first frame edge case)
+            for lid, d in zip(new_landmark_ids, new_descs):
                 if d.sum() != 0.0:
                     self._update_landmark_descriptor(int(lid), d)
                     self._buffer_new_landmark(int(lid))
             self._flush_hnsw_buffer(batch_size=512)
 
-        # ========== 7. LOOP CLOSURE DETECTION ==========
-        # Query similar frames using current descriptors (periodic)
-        # Exclude current landmarks and require a temporal gap
+        # ========== 6. LOOP CLOSURE DETECTION (periodic) ==========
         loop_candidates = []
-        if self.current_frame_id % 5 == 0 and self.prev_keypoints is not None:
-            current_lm_set = set(int(lid) for lid in landmark_ids)
-            min_gap = 9  # Minimum frame gap to avoid trivial matches
-            loop_candidates = self.query_similar_landmarks(
-                valid_descs, k=20, exclude_ids=current_lm_set, min_frame_gap=min_gap
-            )
-            candidates = self.query_similar_frames(
-                valid_descs, k_landmarks=20, top_frames=3,
-                exclude_ids=current_lm_set, min_frame_gap=min_gap
-            )
-            self.prev_descriptors_for_lc = valid_descs  # Store for main loop LC queries
-            self.lc_matched_frames = candidates  # Store matched frame candidates
-            print(f"** Loop closure (frame[{self.current_frame_id}]) candidates:", candidates, "**")
+        if self.current_frame_id % 5 == 0 and n_tracked > 0:
+            # Use tracked landmark descriptors from the HNSW index (just updated above)
+            # Gather descriptors for current frame's landmarks from the running mean
+            all_lm_ids = np.concatenate([tracked_landmark_ids, new_landmark_ids]) if len(new_landmark_ids) > 0 else tracked_landmark_ids
+            current_lm_set = set(int(lid) for lid in all_lm_ids)
+
+            # Collect descriptors we have for current landmarks
+            lc_desc_list = []
+            for lid in all_lm_ids:
+                lid_int = int(lid)
+                if lid_int in self.landmark_desc:
+                    lc_desc_list.append(self.landmark_desc[lid_int])
+            
+            if len(lc_desc_list) > 0:
+                lc_descs = np.vstack(lc_desc_list)
+                min_gap = 9
+                loop_candidates = self.query_similar_landmarks(
+                    lc_descs, k=35, exclude_ids=current_lm_set, min_frame_gap=min_gap
+                )
+                candidates = self.query_similar_frames(
+                    lc_descs, k_landmarks=20, top_frames=3,
+                    exclude_ids=current_lm_set, min_frame_gap=min_gap
+                )
+                self.lc_matched_frames = candidates
+                print(f"** Loop closure (frame[{self.current_frame_id}]) queried {len(lc_descs)} descs, candidates:", candidates, "**")
+            else:
+                self.lc_matched_frames = []
         else:
             self.lc_matched_frames = []
 
-        # ========== 8. OBSERVATIONS OUTPUT FOR OPTIMIZER ==========
-        # Format: observations = [(landmark_id, frame_id, uv_pixel_coords), ...]
-        # new_landmarks_3d = {landmark_id: np.array([x,y,z])} for newly created landmarks
-        observations = []
-        new_landmarks_3d = {}
-        for idx, lid in enumerate(landmark_ids):
-            uv = valid_curr_keypts[idx]
-            observations.append((int(lid), self.current_frame_id, uv.astype(np.float32)))
-            if need_new[idx]:
-                new_landmarks_3d[int(lid)] = points_3d[idx]
+        # ========== 7. STATE UPDATE ==========
+        # Merge tracked + new keypoints for next frame's KLT
+        all_keypoints = np.concatenate([tracked_keypoints, new_keypoints], axis=0) if len(new_keypoints) > 0 else tracked_keypoints
+        all_track_ids = np.concatenate([tracked_landmark_ids, new_landmark_ids]) if len(new_landmark_ids) > 0 else tracked_landmark_ids
 
-        # ========== 9. STATE UPDATE ==========
-        # Save current frame data for next iteration
-        self.prev_keypoints = valid_curr_keypts
+        self.prev_keypoints = all_keypoints if len(all_keypoints) > 0 else None
         self.prev_frame = left_img.copy()
-        self.prev_track_ids = track_ids
+        self.prev_track_ids = all_track_ids if len(all_track_ids) > 0 else None
         self.current_frame_id += 1
 
-        print(f"[Frame {self.current_frame_id-1}] Obs:{len(observations)} NewLM:{len(new_landmarks_3d)}")
+        print(f"[Frame {self.current_frame_id-1}] Tracked:{n_tracked} New:{len(new_keypoints)} Obs:{len(observations)} NewLM:{len(new_landmarks_3d)}")
         return observations, new_landmarks_3d, loop_candidates
         
 

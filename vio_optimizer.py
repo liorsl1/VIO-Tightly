@@ -52,6 +52,7 @@ class GraphOptimizer:
         # --- Landmark management ---
         self.landmark_initialized = set()  # L(id) already in ISAM2 Values
         self.landmark_obs_count = {}       # {landmark_id: number of observations added}
+        self.landmark_frozen = set()       # Landmarks frozen due to high uncertainty
         # Buffer: landmarks wait here until they have 2+ observations from different poses
         # {landmark_id: {"point_cam": np.array, "first_state": int, "observations": [(state_idx, uv), ...]}}
         self.landmark_buffer = {}
@@ -172,6 +173,9 @@ class GraphOptimizer:
 
         # --- Case 1: Landmark already in ISAM2 — just add a new projection factor ---
         if landmark_id in self.landmark_initialized:
+            # Skip frozen (high-uncertainty) landmarks
+            if landmark_id in self.landmark_frozen:
+                return
             # Depth check: skip if landmark is behind the camera from this pose
             if not self._is_landmark_in_front(landmark_id, state_idx):
                 return
@@ -184,9 +188,9 @@ class GraphOptimizer:
         if landmark_id in self.landmark_buffer:
             buf = self.landmark_buffer[landmark_id]
             buf["observations"].append((state_idx, np.array(uv, dtype=float)))
-            # Check if we have observations from 2+ distinct poses
+            # Check if we have observations from 3+ distinct poses
             distinct_poses = set(s for s, _ in buf["observations"])
-            if len(distinct_poses) >= 2:
+            if len(distinct_poses) >= 3:
                 self._promote_landmark(landmark_id)
             return
 
@@ -446,6 +450,44 @@ class GraphOptimizer:
             "n_landmarks": len(self.landmark_initialized),
         }
         return metrics
+
+    # ==================== Landmark Uncertainty Filtering ====================
+
+    def filter_uncertain_landmarks(self, max_trace: float = 3.0) -> int:
+        """Freeze landmarks whose position uncertainty exceeds a threshold.
+
+        Computes the marginal covariance for each active (non-frozen) landmark
+        and freezes those where trace(cov) > max_trace. Frozen landmarks will
+        no longer receive new projection factors.
+
+        Args:
+            max_trace: Maximum allowed trace of 3x3 position covariance (m^2).
+                       Default 3.0 means avg std > ~1m per axis.
+
+        Returns:
+            Number of newly frozen landmarks.
+        """
+        if gtsam is None or self.isam is None:
+            return 0
+
+        newly_frozen = 0
+        for lm_id in list(self.landmark_initialized):
+            if lm_id in self.landmark_frozen:
+                continue
+            try:
+                cov = self.isam.marginalCovariance(L(lm_id))
+                if np.trace(cov) > max_trace:
+                    self.landmark_frozen.add(lm_id)
+                    newly_frozen += 1
+            except Exception:
+                # Covariance computation can fail for poorly connected variables
+                self.landmark_frozen.add(lm_id)
+                newly_frozen += 1
+
+        if newly_frozen > 0:
+            print(f"  Froze {newly_frozen} high-uncertainty landmarks "
+                  f"(total frozen: {len(self.landmark_frozen)}/{len(self.landmark_initialized)})")
+        return newly_frozen
 
     # ==================== Covariance & Degeneracy ====================
 
