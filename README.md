@@ -191,11 +191,21 @@ Absolute Trajectory Error after SE(3) Umeyama alignment on **MH_01_easy** (328 f
 
 | Metric | Value |
 |--------|-------|
-| **RMSE** | 0.886 m |
-| Mean | 0.303 m |
-| Median | 0.175 m |
-| Max | 10.189 m |
-| Std | 0.833 m |
+| **RMSE** | 0.5779 m |
+| Mean | 0.3455 m |
+| Median | 0.2843 m |
+| Max | 6.6450 m |
+| Std | 0.4633 m |
+------------------------------------------------------------
+ #### Relative Trajectory Error (RTE)
+ 
+| Metric | Value |
+|--------|-------|
+| **RMSE** | 0.4775 m |
+| Mean | 0.1289 m |
+| Median | 0.0633 m |
+| Max | 6.1195 m |
+| Std | 0.4598 m |
 
 
 The Rerun viewer launches automatically. Processing logs are printed to the terminal with per-frame diagnostics including graph size, optimization error, and tracking statistics.
