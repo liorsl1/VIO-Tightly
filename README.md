@@ -40,13 +40,15 @@ Processes stereo image pairs to produce landmark observations and 3D triangulati
 
 | Stage | Method | Purpose |
 |-------|--------|---------|
-| Feature Extraction | SuperPoint (1024 pts) | Repeatable keypoints with dense descriptors |
-| Stereo Matching | LightGlue + Epipolar Filter | Left-right correspondence with geometric validation |
+| Feature Extraction | XFeat (1024 pts) | Repeatable keypoints with dense descriptors |
+| Stereo Matching | Cosine Similarity + Epipolar Filter | Left-right correspondence with geometric validation |
 | Temporal Tracking | KLT Optical Flow | Frame-to-frame feature association with forward-backward check |
 | Triangulation | Linear SVD (rectified) | Depth from stereo disparity, filtered by reprojection error |
-| Track Management | Track ID propagation | Persistent landmark identity across frames |
+| Track Management & Propagation | Feature Spatial Distribution filter | Persistent landmark identity across frames |
 
-**IMU-Guided Tracking**: When the optimizer converges (avg error < 2.0), IMU-predicted rotation initializes optical flow for improved tracking under fast motion.
+- **IMU-Guided Tracking**: When the optimizer converges (avg error < 2.0), IMU-predicted rotation initializes optical flow for improved tracking under fast motion.
+
+- **Spatial distribution ensurance**:  Choose only observations/keypoints that are well distributed across the image, preventing clustered features from degenerating the factor graph.
 
 ---
 
