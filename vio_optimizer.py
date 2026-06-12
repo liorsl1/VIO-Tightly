@@ -284,7 +284,7 @@ class GraphOptimizer:
         buf = self.landmark_buffer.pop(landmark_id)
         # Validate: reject landmarks with degenerate camera-frame depth
         depth = buf["point_cam"][2]
-        if depth < 0.25 or depth > 20.0:
+        if depth < 0.2 or depth > 20.0:
             # Bad triangulation — don't add to graph
             return
         # Transform landmark from camera frame to world frame using the first observing pose
@@ -311,7 +311,7 @@ class GraphOptimizer:
             else:
                 world_T_cam = world_T_body
             pt_cam = world_T_cam.transformTo(pt_gtsam)
-            if pt_cam[2] < 0.25:  # Behind camera or too close
+            if pt_cam[2] < 0.2:  # Behind camera or too close
                 return  # Reject this landmark entirely
 
         self.initial.insert(L(landmark_id), gtsam.Point3(*pt3_world))

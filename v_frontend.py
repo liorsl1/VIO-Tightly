@@ -795,7 +795,7 @@ class vFeature:
         return np.asarray(landmark_ids)
 
     # --------------- Hook in process_stereo_frame ---------------
-    MIN_TRACKED_FEATURES = 300  # Trigger new detection when tracks drop below this
+    MIN_TRACKED_FEATURES = 500  # Trigger new detection when tracks drop below this
     min_tracked_dist = 10.0
     def process_stereo_frame2(self, left_img, right_img, imu_pose=None, R_prev_curr=None):
         """Main stereo processing pipeline — KLT-first, detect only when needed.

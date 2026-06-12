@@ -77,7 +77,10 @@ Incremental nonlinear optimization via ISAM2 with the following factor types:
 **Promotion Validation**:
 - Camera-frame depth ∈ [0.3m, 30m]
 - Positive depth from ALL observing cameras (Z > 0.5m)
-- Minimum baseline between observing poses (≥ 5cm)
+- Maximum parallax angle ≥ 2.5° between any two observing cameras
+
+**Parallax Verification**: Instead of a naive baseline distance check, landmarks are validated by computing the maximum angle between observation rays from camera centers to the 3D point. This directly measures triangulation quality ($\sigma_d^2 \propto d^2 / \sin^2(\theta)$), naturally adapts to landmark depth, and generalizes to N>2 observations. Low-parallax landmarks produce near-zero Jacobians in the projection factor, causing indeterminate linear systems — rejecting them significantly improves ISAM2 convergence stability.
+(This greatly increased the trajectory accuracy)
 
 **Robust Loss**: Huber norm (k=1.345) on pixel noise (σ=2px) rejects outlier measurements without removing them from the graph.
 
