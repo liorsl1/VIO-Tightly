@@ -85,7 +85,7 @@ class GraphOptimizer:
         )
 
         # Spatial distribution: grid bucketing (cell_size in pixels)
-        self.obs_cell_size = 16  # pixels — one observation per 16x16 cell per frame
+        self.obs_cell_size = 13  # pixels — one observation per 13x13 cell per frame
         self._frame_occupied_cells = {}  # {state_idx: set of (row, col) tuples}
 
     def _make_projection_factor(self, measurement, state_idx: int, landmark_id: int):
