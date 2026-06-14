@@ -878,9 +878,9 @@ class vFeature:
                 else:
                     # KLT from left → right image (stereo matching via optical flow)
                     lk_params_stereo = dict(
-                        winSize=(21, 5),  # Wide horizontal, narrow vertical (rectified)
+                        winSize=(17, 5),  # Wide horizontal, narrow vertical (rectified)
                         maxLevel=3,
-                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+                        criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.01),
                     )
                     sp_kp_cv = sp_kp.reshape(-1, 1, 2)
                     right_pts, status, _ = cv2.calcOpticalFlowPyrLK(
@@ -1019,7 +1019,7 @@ class vFeature:
                 lc_descs = np.vstack(lc_desc_list)
                 min_gap = 9
                 loop_candidates = self.query_similar_landmarks(
-                    lc_descs, k=35, exclude_ids=current_lm_set, min_frame_gap=min_gap
+                    lc_descs, k=50, exclude_ids=current_lm_set, min_frame_gap=min_gap
                 )
                 candidates = self.query_similar_frames(
                     lc_descs, k_landmarks=30, top_frames=3,

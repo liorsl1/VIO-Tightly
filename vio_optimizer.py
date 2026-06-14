@@ -257,7 +257,10 @@ class GraphOptimizer:
             # Check if we have observations from 3+ distinct poses
             distinct_poses = set(s for s, _ in buf["observations"])
             if len(distinct_poses) >= 3:
-                self._promote_landmark(landmark_id)
+                # Only attempt promotion every 2 new distinct poses after the initial 3,
+                # to avoid repeated expensive parallax checks on every observation
+                if len(distinct_poses) == 3 or len(distinct_poses) % 2 == 1:
+                    self._promote_landmark(landmark_id)
             return
 
         # --- Case 3: First time seeing this landmark — add to buffer ---
@@ -280,20 +283,25 @@ class GraphOptimizer:
         Validates that the landmark is geometrically visible (positive depth) from
         all observing poses before committing — prevents indeterminate systems from
         zero-Jacobian projection factors.
+
+        Returns without popping the buffer if parallax/depth checks fail,
+        allowing the landmark to accumulate more observations and retry later.
         """
-        buf = self.landmark_buffer.pop(landmark_id)
+        buf = self.landmark_buffer[landmark_id]
         # Validate: reject landmarks with degenerate camera-frame depth
         depth = buf["point_cam"][2]
-        if depth < 0.2 or depth > 20.0:
-            # Bad triangulation — don't add to graph
+        if depth < 0.1 or depth > 15.0:
+            # Bad triangulation — remove permanently
+            self.landmark_buffer.pop(landmark_id)
             return
+
         # Transform landmark from camera frame to world frame using the first observing pose
         pt3_world = self._landmark_to_world(buf["point_cam"], buf["first_state"])
 
         # Validate: minimum parallax angle between observing poses
         max_parallax = self._max_parallax_deg(pt3_world, buf["observations"])
         if max_parallax < 2.5:
-            print(f"  Rejecting landmark {landmark_id} due to low parallax ({max_parallax:.1f}°)")
+            # Not enough parallax yet — keep in buffer for later retry
             return
 
         # Validate: landmark must be in front of ALL observing cameras
@@ -312,7 +320,11 @@ class GraphOptimizer:
                 world_T_cam = world_T_body
             pt_cam = world_T_cam.transformTo(pt_gtsam)
             if pt_cam[2] < 0.2:  # Behind camera or too close
-                return  # Reject this landmark entirely
+                # Keep in buffer — pose estimates may improve later
+                return
+
+        # All checks passed — pop from buffer and commit to graph
+        self.landmark_buffer.pop(landmark_id)
 
         self.initial.insert(L(landmark_id), gtsam.Point3(*pt3_world))
         self.landmark_initialized.add(landmark_id)
