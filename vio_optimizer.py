@@ -290,7 +290,7 @@ class GraphOptimizer:
         buf = self.landmark_buffer[landmark_id]
         # Validate: reject landmarks with degenerate camera-frame depth
         depth = buf["point_cam"][2]
-        if depth < 0.1 or depth > 15.0:
+        if depth < 0.2 or depth > 15.0:
             # Bad triangulation — remove permanently
             self.landmark_buffer.pop(landmark_id)
             return

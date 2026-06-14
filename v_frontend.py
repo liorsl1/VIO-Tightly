@@ -475,9 +475,10 @@ class vFeature:
         prev_kp_cv = prev_keypoints.reshape(-1, 1, 2)
         initial_guess = None
         if R_prev_curr is not None:
-            K = np.array([[self.fx, 0, self.cx],
-                          [0, self.fy, self.cy],
-                          [0, 0, 1]], dtype=np.float64)
+            # K = np.array([[self.fx, 0, self.cx],
+            #               [0, self.fy, self.cy],
+            #               [0, 0, 1]], dtype=np.float64)
+            K = self.P1[:, :3]  # Use the rectified projection matrix for the left camera
             pts_h = np.hstack([prev_keypoints, np.ones((len(prev_keypoints), 1))])
             pts_norm = (np.linalg.inv(K) @ pts_h.T).T
             pts_rotated = (R_prev_curr @ pts_norm.T).T
@@ -504,10 +505,10 @@ class vFeature:
         
         # Forward-backward consistency check
         fb_dist = np.linalg.norm(prev_keypoints - prev_keypoints_back, axis=1)
-        valid = (status_fwd.flatten() == 1) & (status_bwd.flatten() == 1) & (fb_dist < 3.0)
+        valid = (status_fwd.flatten() == 1) & (status_bwd.flatten() == 1) & (fb_dist < 1)
         
         n = len(prev_keypoints)
-        mode = "IMU+K" if R_prev_curr is not None else "No IMU"
+        mode = "IMU+P1" if R_prev_curr is not None else "No IMU"
         print(f"Optical flow [{mode}]: valid={valid.sum()}/{n}", end="")
         if valid.sum() > 0:
             print(f"  mean_fb_err={fb_dist[valid].mean():.4f}px")

@@ -394,7 +394,7 @@ def main():
                     continue
                 lm_world = current_est.atPoint3(lm_key)
                 lm_cam = T_cam_world.transformFrom(gtsam.Point3(lm_world))
-                if lm_cam[2] <= 0.5:
+                if lm_cam[2] <= 0.3:
                     continue
                 uv = obs_by_lm.get(candidate_lm_id)
                 if uv is None:
@@ -486,7 +486,7 @@ def main():
                         continue
                     lm_world = vis_est.atPoint3(lm_key)
                     lm_cam = T_cam_world_vis.transformFrom(gtsam.Point3(lm_world))
-                    if lm_cam[2] > 0.5:
+                    if lm_cam[2] > 0.3:
                         lc_ids.append(cid)
 
         visualizer.update(
