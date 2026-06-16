@@ -71,7 +71,11 @@ class GraphOptimizer:
             np.array([0.03, 0.03, 0.03, 0.1, 0.1, 0.1])
         )
         self.prior_vel_noise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
-        self.prior_bias_noise = gtsam.noiseModel.Isotropic.Sigma(6, 1e-3)
+        # Bias prior: trust static calibration to ~0.01 m/s² accel, ~0.003 rad/s gyro.
+        # Must be loose enough for online refinement but tight enough to anchor near truth.
+        self.prior_bias_noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([0.01, 0.01, 0.01, 0.003, 0.003, 0.003])
+        )
         # Landmark regularization prior (sigma=1.5m).
         # Tight enough to prevent ISAM2 from pushing landmarks to degenerate positions
         # during relinearization, but loose enough not to bias converged estimates.
@@ -597,7 +601,7 @@ class GraphOptimizer:
 
     # ==================== Landmark Uncertainty Filtering ====================
 
-    def filter_uncertain_landmarks(self, max_trace: float = 3.0) -> int:
+    def filter_uncertain_landmarks(self, max_trace: float = 2.0) -> int:
         """Freeze landmarks whose position uncertainty exceeds a threshold.
 
         Computes the marginal covariance for each active (non-frozen) landmark
@@ -606,7 +610,7 @@ class GraphOptimizer:
 
         Args:
             max_trace: Maximum allowed trace of 3x3 position covariance (m^2).
-                       Default 3.0 means avg std > ~1m per axis.
+                       Default 2.0 means avg std > ~0.8m per axis.
 
         Returns:
             Number of newly frozen landmarks.

@@ -40,6 +40,9 @@ class vFeature:
         self.prev_descriptors = None
         self.prev_frame = None
         self.prev_track_ids = None  # Track IDs from the previous frame
+        self.MIN_TRACKED_FEATURES = 500  # Trigger new detection when tracks drop below this
+        self.MIN_TRACKED_DIST = 0  # Minimum median pixel displacement to consider tracks valid
+
         
         # --- Optimization interface ---
         self.new_landmarks = []  # Landmarks ready for optimization
@@ -72,6 +75,10 @@ class vFeature:
                 'verlab/accelerated_features', 'XFeat',
                 pretrained=True, top_k=1024, trust_repo=True
             ).eval().to(self.device)
+            # XFeat caches its own device (defaults to CUDA if available) and uses it
+            # to move input tensors in preprocess_tensor. Override it to match self.device,
+            # otherwise inputs land on CUDA while weights are on CPU -> dtype/device mismatch.
+            self.xfeat.dev = _torch.device(self.device)
             print(f"XFeat loaded on {self.device} (64D descriptors)")
         else:
             print("Initializing SuperPoint and LightGlue...")
@@ -464,7 +471,7 @@ class vFeature:
         """
         # Convert keypoints to float32 for optical flow
         prev_keypoints = np.array(prev_keypoints, dtype=np.float32)
-        
+        median_displacement = 0.0
         lk_params = dict(
             winSize=(15, 15),
             maxLevel=4,
@@ -507,14 +514,24 @@ class vFeature:
         fb_dist = np.linalg.norm(prev_keypoints - prev_keypoints_back, axis=1)
         valid = (status_fwd.flatten() == 1) & (status_bwd.flatten() == 1) & (fb_dist < 1)
         
+        # Per-feature temporal displacement; keep only features that moved enough.
+        # Combine the displacement threshold with the FB-consistency mask so that
+        # static (near-zero motion) features are excluded from the returned tracks.
+        displacements = np.linalg.norm(curr_keypoints - prev_keypoints, axis=1)
+        valid = valid & (displacements > self.MIN_TRACKED_DIST)
+        
+        # Median pixel displacement of the retained (moving) features
+        if valid.sum() > 0:
+            median_displacement = float(np.median(displacements[valid]))
+        
         n = len(prev_keypoints)
         mode = "IMU+P1" if R_prev_curr is not None else "No IMU"
         print(f"Optical flow [{mode}]: valid={valid.sum()}/{n}", end="")
         if valid.sum() > 0:
-            print(f"  mean_fb_err={fb_dist[valid].mean():.4f}px")
+            print(f"  mean_fb_err={fb_dist[valid].mean():.4f}px  median_disp={median_displacement:.2f}px")
         else:
             print()
-        return valid, curr_keypoints[valid]
+        return valid, curr_keypoints[valid], median_displacement
         
 
 
@@ -796,8 +813,7 @@ class vFeature:
         return np.asarray(landmark_ids)
 
     # --------------- Hook in process_stereo_frame ---------------
-    MIN_TRACKED_FEATURES = 500  # Trigger new detection when tracks drop below this
-    min_tracked_dist = 10.0
+    min_tracked_dist = 2.0  # px — min median parallax since last keyframe to accept a frame
     def process_stereo_frame2(self, left_img, right_img, imu_pose=None, R_prev_curr=None):
         """Main stereo processing pipeline — KLT-first, detect only when needed.
 
@@ -822,11 +838,27 @@ class vFeature:
         # Track existing features from previous frame to current frame
         tracked_keypoints = np.empty((0, 2), dtype=np.float32)
         tracked_landmark_ids = np.empty((0,), dtype=int)
+        median_displacement = 0.0
 
         if self.prev_keypoints is not None and len(self.prev_keypoints) > 0:
-            valid_mask, curr_tracked = self.track_features_temporal(
+            if len(tracked_landmark_ids) < 300:
+                self.MIN_TRACKED_DIST = 0
+            else:
+                self.MIN_TRACKED_DIST = 20.0
+            valid_mask, curr_tracked, median_displacement = self.track_features_temporal(
                 self.prev_frame, left_img, self.prev_keypoints, R_prev_curr=R_prev_curr
             )
+
+            # --- Keyframe gating: insufficient parallax since last keyframe ---
+            # Skip this frame: keep prev_frame/keypoints/track_ids UNCHANGED so the next
+            # frame measures parallax from the SAME keyframe (parallax accumulates until
+            # it crosses the threshold). Return empty observations/landmarks/loop_candidates
+            # so the backend adds no projection factors for this static frame.
+            # if median_displacement < self.min_tracked_dist:
+            #     print(f"  [SKIP frame {self.current_frame_id}] parallax "
+            #           f"{median_displacement:.2f}px < {self.min_tracked_dist}px (no keyframe)")
+            #     return [], {}, []
+
             tracked_keypoints = curr_tracked
             tracked_landmark_ids = self.prev_track_ids[valid_mask]
         
@@ -1043,7 +1075,7 @@ class vFeature:
         self.prev_track_ids = all_track_ids if len(all_track_ids) > 0 else None
         self.current_frame_id += 1
 
-        print(f"[Frame {self.current_frame_id-1}] Tracked:{n_tracked} New:{len(new_keypoints)} Obs:{len(observations)} NewLM:{len(new_landmarks_3d)}")
+        print(f"[Frame {self.current_frame_id-1}] Tracked:{n_tracked} New:{len(new_keypoints)} Obs:{len(observations)} NewLM:{len(new_landmarks_3d)} MedianDisp:{median_displacement:.2f}px")
         return observations, new_landmarks_3d, loop_candidates
         
 
@@ -1088,7 +1120,7 @@ if __name__ == "__main__":
             first_run = False
 
         # Process the first stereo frames
-        observations, new_landmarks = vfeature.process_stereo_frame2(left_img, right_img)
+        observations, new_landmarks, loop_candidates, median_disp = vfeature.process_stereo_frame2(left_img, right_img)
 
 
     # # Process stereo frame

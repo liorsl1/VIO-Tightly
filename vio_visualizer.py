@@ -262,10 +262,32 @@ class VIOVisualizer:
             rr.LineStrips3D([traj], colors=[[255, 50, 50]]),
         )
 
-        # Log ground truth trajectory in green (shifted to start at same origin as estimate)
-        if len(self.gt_trajectory_poses) >= 2:
+        # Log ground truth trajectory in green (SE(3) aligned to estimated trajectory)
+        if len(self.gt_trajectory_poses) >= 2 and len(self.trajectory_poses) >= 3:
             gt_traj = np.array(self.gt_trajectory_poses, dtype=np.float32)
-            # Shift GT so its first point aligns with the estimated trajectory's first point
+            est_traj = np.array(self.trajectory_poses, dtype=np.float32)
+            # Umeyama alignment: find R, t that maps est → gt, then invert to map gt → est frame
+            n = min(len(est_traj), len(gt_traj))
+            est_mean = est_traj[:n].mean(axis=0)
+            gt_mean = gt_traj[:n].mean(axis=0)
+            H = (est_traj[:n] - est_mean).T @ (gt_traj[:n] - gt_mean)
+            U, S, Vt = np.linalg.svd(H)
+            d = np.linalg.det(Vt.T @ U.T)
+            R_align = Vt.T @ np.diag([1, 1, d]) @ U.T
+            t_align = gt_mean - R_align @ est_mean
+            # Apply inverse alignment: gt_in_est_frame = R_align^T @ (gt - t_align)
+            # Or equivalently, align est to gt and show gt as-is... but we want gt in est frame:
+            # est_aligned = R_align @ est + t_align ≈ gt
+            # So gt_in_est_frame = R_align^T @ (gt - t_align)
+            R_inv = R_align.T
+            t_inv = -R_align.T @ t_align
+            gt_traj_aligned = (R_inv @ gt_traj.T).T + t_inv
+            rr.log(
+                "world/ground_truth",
+                rr.LineStrips3D([gt_traj_aligned], colors=[[50, 255, 50, 140]]),
+            )
+        elif len(self.gt_trajectory_poses) >= 2:
+            gt_traj = np.array(self.gt_trajectory_poses, dtype=np.float32)
             gt_offset = self.trajectory_poses[0] - gt_traj[0]
             gt_traj_aligned = gt_traj + gt_offset
             rr.log(

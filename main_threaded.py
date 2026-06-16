@@ -209,13 +209,37 @@ def main():
     # --- 1. VIO System Initialization ---
     # =================================================================
     print("Initializing VIO system...")
-    imu_calib = IMUCalibration()
+    
+    # Estimate IMU biases and gravity-aligned orientation from static period
+    accel_bias_init, gyro_bias_init, initial_orient_quat, _ = (
+        data_manager.calculate_initial_biases_and_gravity(static_duration_sec=3.0)
+    )
+    print(f"  Initial gyro bias: {gyro_bias_init}")
+    print(f"  Initial accel bias: {accel_bias_init}")
+    
+    imu_calib = IMUCalibration(
+        accel_bias=accel_bias_init,
+        gyro_bias=gyro_bias_init,
+        accel_noise=2.0e-3 * 5,
+        gyro_noise=(1.6968e-4) * 5,  # 5x datasheet
+    )
     imu_pipeline = IMUPipeline(imu_calib)
     optimizer = GraphOptimizer(
         use_isam=True, body_P_sensor=data_manager.T_imu_cam0, imu_calib=imu_calib
     )
 
-    initial_pose = gtsam.Pose3()
+    # Gravity-aligned initial orientation (pitch/roll only, yaw=0).
+    # Accelerometer static mean points "up" in body frame.
+    # Find minimal rotation: body "up" → world "up" [0,0,1].
+    static_accel = data_manager.imu_df[["a_x", "a_y", "a_z"]].values[:int(3.0 * 200)]
+    up_body = static_accel.mean(axis=0)
+    up_body /= np.linalg.norm(up_body)
+    print(f"  Estimated gravity direction in body frame: {up_body}")
+    initial_rot, _ = R.align_vectors([[0, 0, 1]], [up_body])
+    initial_pose = gtsam.Pose3(
+        gtsam.Rot3(initial_rot.as_matrix()), gtsam.Point3(0, 0, 0)
+    )
+    # initial_pose = gtsam.Pose3()
     initial_vel = np.zeros(3)
     initial_bias = gtsam.imuBias.ConstantBias(
         imu_calib.accel_bias, imu_calib.gyro_bias
