@@ -11,7 +11,7 @@ A real-time stereo visual-inertial odometry system using factor graph optimizati
 <p align="center">
   <img src="docs/VIO-keyframe_parallax.gif" alt="VIO Run" width="800"/>
   <br/>
-  <sub>Cyan colored dots — Re-visited landmarks from previous frames (valid loop closure candidates)</sub>
+  <sub>Cyan colored dots — Re-visited landmarks from previous frames (valid loop closure candidates) <br>Green Trajectory - GT</br></sub>
 </p>
 
 ---
