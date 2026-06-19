@@ -1,15 +1,103 @@
-# VIO-Tightly — Algorithm State & Update Log
+# VIO-Tightly — Tightly-Coupled Visual-Inertial Odometry
 
-A tightly-coupled stereo-inertial odometry (VIO) system built on GTSAM/ISAM2 with
-explicit landmarks, a threaded frontend/backend, and keyframe-based graph growth.
+A real-time stereo visual-inertial odometry system using factor graph optimization (GTSAM/ISAM2) with explicit landmark management, keyframe-based graph growth, loop closure detection, and live 3D visualization.
 
-This document is meant to be read top-to-bottom: it explains the **theory** behind each
-design choice, the **current implementation** (with live parameter values), and the
-**history** of what changed and why.
+![Pipeline](https://img.shields.io/badge/Backend-GTSAM_ISAM2-blue) ![Features](https://img.shields.io/badge/Frontend-XFeat-green) ![Viz](https://img.shields.io/badge/Viz-Rerun-orange)
 
 ---
 
-## 1. System Overview
+## Result Showcase
+
+<p align="center">
+  <img src="docs/VIO-keyframe_parallax.gif" alt="VIO Run" width="800"/>
+  <br/>
+  <sub>Cyan colored dots — Re-visited landmarks from previous frames (valid loop closure candidates)</sub>
+</p>
+
+---
+
+## System Architecture
+
+```mermaid
+graph LR
+    A[Stereo Images] --> B[Visual Frontend]
+    C[IMU 200 Hz] --> D[IMU Preintegration]
+    B --> E[Factor Graph<br/>ISAM2]
+    D --> E
+    B --> F[Loop Closure<br/>HNSW]
+    F --> E
+    E --> G[Optimized State]
+    G --> H[Rerun Visualizer]
+```
+
+---
+
+## Pipeline Components
+
+### 1. Visual Frontend (`v_frontend.py`)
+
+Processes stereo image pairs to produce landmark observations, 3D triangulations, and keyframe decisions via median pixel displacement.
+
+| Stage | Method | Purpose |
+|-------|--------|---------|
+| Feature Extraction | XFeat (1024 pts) | Repeatable keypoints with dense descriptors |
+| Stereo Matching | Cosine Similarity + Epipolar Filter | Left-right correspondence with geometric validation |
+| Temporal Tracking | KLT Optical Flow (forward-backward) | Frame-to-frame association; static features filtered by displacement threshold |
+| Triangulation | Linear SVD (rectified) | Depth from stereo disparity, filtered by reprojection error |
+| Keyframe Decision | Depth uncertainty from Parallax | Only frames with sufficient parallax are committed to the graph |
+| Loop Closure | HNSW descriptor index + frame voting | Re-observed landmarks from ≥15 frames ago, geometric visibility filter |
+
+- **IMU-Guided Tracking**: When the optimizer converges (`avg_error < 2.0`), IMU-predicted rotation initializes optical flow for improved tracking under fast motion.
+- **Spatial Distribution**: Grid-based bucketing ensures well-distributed features across the image.
+
+### 2. IMU Preintegration (`imu_pipeline.py`)
+
+Integrates high-rate (200 Hz) accelerometer and gyroscope measurements between keyframes using GTSAM's `PreintegratedImuMeasurements`.
+
+| Aspect | Detail |
+|--------|--------|
+| Noise Model | Continuous-time densities from EuRoC datasheet (5× safety factor) |
+| Bias Handling | Updated from GTSAM after each optimization; random walk properly scaled by √Δt |
+| Accumulation | Not reset on skipped frames — one `ImuFactor` spans the full keyframe interval |
+
+### 3. Factor Graph Backend (`vio_optimizer.py`)
+
+Incremental nonlinear optimization via ISAM2 with explicit 3D landmarks.
+
+| Factor | Variables | Role |
+|--------|-----------|------|
+| `PriorFactorPose3` | X(0) | Anchors world frame origin |
+| `ImuFactor` | X(i), V(i), X(i+1), V(i+1), B(i) | IMU motion constraint |
+| `BetweenFactorConstantBias` | B(i), B(i+1) | Bias random walk (σ scaled by √Δt) |
+| `GenericProjectionFactorCal3_S2` | X(i), L(j) | Pixel reprojection (Huber k=1.345, σ=1.0 px) with body-camera extrinsic |
+| `PriorFactorPoint3` | L(j) | Landmark regularization (σ=1.5 m) |
+
+**Landmark lifecycle**: buffer (first sighting) → promote (3+ poses, parallax ≥ 5°, depth ∈ [0.2, 15] m, cheirality OK) → track (incremental-parallax gate ≥ 2°, grid bucketing 13×13 px).
+
+### 4. Keyframe Gating (`main_threaded.py`)
+
+| Mechanism | Condition |
+|-----------|-----------|
+| Initialization period | Every frame is a keyframe until covariance-trace relative std < 0.002 over 5 KF |
+| Keyframe decision | Accumulated median displacement ≥ 20 px since last keyframe |
+| Non-keyframe handling | Visual observations dropped; IMU accumulates across skipped frames |
+
+### 5. Real-Time Visualization (`vio_visualizer.py`)
+
+Multi-panel [Rerun](https://rerun.io/) viewer with synchronized timelines.
+
+| Panel | Content |
+|-------|---------|
+| 3D Map | Viridis-colored point cloud + red trajectory + pose axes |
+| Left/Right Camera | Feature overlays with per-landmark coloring |
+| Optimization Error | Average error per factor (time-series) |
+| Observations | Landmark count, IMU samples, graph size |
+| Pose Status | Translation, rotation, inter-frame delta, total travel distance |
+
+---
+
+
+## System Overview
 
 | Layer | Responsibility |
 |-------|----------------|
@@ -102,13 +190,6 @@ weak factors; the tighter sigma needs them filtered explicitly.
 - **Huber robust, k = 1.345, σ = 1.0 px** (was 1.5 px). Lowering sigma measurably improved
   accuracy; see §2.2.
 
-### 4.2 Loop-closure reprojection noise  *(NEW)*
-- Separate model `loop_pixel_noise` — **Huber k = 1.345, σ = 1.0 px** — used by
-  `add_loop_closure_observation`. Kept independent from the tracking noise so loop
-  re-observations can be weighted more aggressively without affecting tracking. A single
-  loop re-observation must otherwise compete against the whole accumulated IMU+visual chain
-  and is too weak; this is the "lighter" alternative to a full 6-DOF `BetweenFactorPose3`
-  (still available via `add_loop_closure_pose_constraint`).
 
 ### 4.3 Priors
 | Prior | Value | Purpose |
@@ -298,9 +379,7 @@ flowchart TD
 
 ## 11. Reference Results (baseline)
 
-> Recorded before keyframe gating / observation-parallax gating were enabled
-> (328 frames, every frame committed). Use as a regression baseline; re-measure after the
-> new gating mechanisms.
+
 
 ```
 FINAL ATE (Absolute Trajectory Error)
@@ -322,7 +401,7 @@ FINAL RTE (Relative Trajectory Error)
 
 ---
 
-## 12. Change Log (this session)
+## 12. Change Log
 
 1. **Pixel noise 1.5 → 1.0 px** — improved accuracy.
 2. **Promotion parallax 2.5° → 5°**, depth range `[0.25, 20] → [0.2, 15] m`, grid cell
