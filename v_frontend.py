@@ -40,7 +40,7 @@ class vFeature:
         self.prev_descriptors = None
         self.prev_frame = None
         self.prev_track_ids = None  # Track IDs from the previous frame
-        self.MIN_TRACKED_FEATURES = 500  # Trigger new detection when tracks drop below this
+        self.MIN_TRACKED_FEATURES = 700  # Trigger new detection when tracks drop below this
         self.MIN_TRACKED_DIST = 0  # Minimum median pixel displacement to consider tracks valid
 
         
@@ -374,7 +374,7 @@ class vFeature:
         
         # Remove points with negative or very large depth
         valid &= (np.abs(points_3d[:, 2]) > 0.1)  # Minimum depth
-        valid &= (np.abs(points_3d[:, 2]) < 10.0)  # Maximum depth
+        valid &= (np.abs(points_3d[:, 2]) < 12.0)  # Maximum depth
 
         # Make homogeneous points
         points_homog = np.hstack([points_3d, np.ones((len(points_3d), 1))])
@@ -841,10 +841,10 @@ class vFeature:
         median_displacement = 0.0
 
         if self.prev_keypoints is not None and len(self.prev_keypoints) > 0:
-            if len(tracked_landmark_ids) < 300:
-                self.MIN_TRACKED_DIST = 0
-            else:
-                self.MIN_TRACKED_DIST = 20.0
+            # if len(tracked_landmark_ids) < 300:
+            #     self.MIN_TRACKED_DIST = 0
+            # else:
+            #     self.MIN_TRACKED_DIST = 20.0
             valid_mask, curr_tracked, median_displacement = self.track_features_temporal(
                 self.prev_frame, left_img, self.prev_keypoints, R_prev_curr=R_prev_curr
             )
@@ -1076,7 +1076,7 @@ class vFeature:
         self.current_frame_id += 1
 
         print(f"[Frame {self.current_frame_id-1}] Tracked:{n_tracked} New:{len(new_keypoints)} Obs:{len(observations)} NewLM:{len(new_landmarks_3d)} MedianDisp:{median_displacement:.2f}px")
-        return observations, new_landmarks_3d, loop_candidates
+        return observations, new_landmarks_3d, loop_candidates, median_displacement
         
 
 

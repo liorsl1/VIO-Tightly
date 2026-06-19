@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 import pandas as pd
-from imu_utils import from_two_vectors2,from_two_vectors, align_ground_truth_to_gravity_world, from_two_vectors3
+#from imu_utils import from_two_vectors2,from_two_vectors, align_ground_truth_to_gravity_world, from_two_vectors3
 from scipy.spatial.transform import Rotation as R
 
 import os
@@ -96,6 +96,60 @@ class DataManager:
             initial_orientation_quat (np.array): Initial orientation [x,y,z,w] to align IMU with a gravity-defined world frame.
             world_gravity_vec (np.array): The ideal gravity vector in the world frame [0, 0, -g].
         """
+
+        # def from_two_vectors3(v0, v1, forward_reference=None):
+        #     """
+        #     Improved version that:
+        #     1. Properly aligns two vectors
+        #     2. Maintains a reference forward direction (optional)
+            
+        #     Args:
+        #         v0: Starting vector (in original frame)
+        #         v1: Target vector (in target frame)
+        #         forward_reference: Reference forward vector to constrain yaw (None for default)
+        #     Returns:
+        #         quaternion [x,y,z,w] that rotates v0 to v1 while minimizing yaw change
+        #     """
+        #     v0 = v0 / np.linalg.norm(v0)
+        #     v1 = v1 / np.linalg.norm(v1)
+        #     dot = np.dot(v0, v1)
+            
+        #     # Handle nearly parallel vectors
+        #     if dot > 0.999999:
+        #         return np.array([0.0, 0.0, 0.0, 1.0])  # Identity
+            
+        #     if dot < -0.999999:
+        #         # Find minimal rotation by aligning to a reference axis
+        #         axis = np.array([1.0, 0.0, 0.0]) if forward_reference is None else forward_reference
+        #         axis = axis - v0 * np.dot(axis, v0)  # Make orthogonal
+        #         axis = axis / np.linalg.norm(axis)
+        #         return np.array([axis[0], axis[1], axis[2], 0.0])  # 180° rotation
+            
+        #     # Standard case - compute rotation with yaw preservation
+        #     axis = np.cross(v0, v1)
+        #     axis = axis / np.linalg.norm(axis)
+        #     angle = np.arccos(dot)
+            
+        #     # Optional: Minimize yaw deviation using reference
+        #     if forward_reference is not None:
+        #         # Project reference onto plane orthogonal to rotation axis
+        #         ref_proj = forward_reference - axis * np.dot(forward_reference, axis)
+        #         if np.linalg.norm(ref_proj) > 1e-6:
+        #             ref_proj = ref_proj / np.linalg.norm(ref_proj)
+        #             # Find angle that best preserves the reference
+        #             optimal_angle = np.arctan2(
+        #                 np.dot(np.cross(v0, ref_proj), axis),
+        #                 np.dot(v0, ref_proj)
+        #             )
+        #             angle = optimal_angle
+            
+        #     return np.array([
+        #         axis[0] * np.sin(angle/2),
+        #         axis[1] * np.sin(angle/2),
+        #         axis[2] * np.sin(angle/2),
+        #         np.cos(angle/2)
+        #     ])
+        
         imu_hz = 200  # Assuming 200Hz from your project
         static_samples = int(static_duration_sec * imu_hz)
         
@@ -114,11 +168,12 @@ class DataManager:
         print(f"Estimated gyroscope bias: {bias_gyro}")
 
         # 3. Define the ideal world frame gravity vector
-        world_gravity_vec = np.array([0.0, 0.0, -gravity_norm])
+        world_gravity_vec = np.array([0.0, 0.0, gravity_norm])
 
         # 4. Calculate the initial orientation that aligns the IMU frame with the world frame
         # We want to find the rotation that maps the measured gravity to the ideal gravity.
-        initial_orientation_quat = from_two_vectors3(gravity_imu_frame, world_gravity_vec)
+        initial_orientation_quat = np.array([0.0, 0.0, 0.0, 1.0])  # Default to identity quaternion
+        #initial_orientation_quat = from_two_vectors3(gravity_imu_frame, world_gravity_vec)
         # Verify
  
         #world_gravity_vec[2] = -world_gravity_vec[2]  # Ensure gravity is the opposite
@@ -210,6 +265,8 @@ class DataManager:
 
             left_img = cv2.imread(os.path.join(self.data_dir, "cam0","data", left_img_path), cv2.IMREAD_GRAYSCALE)
             right_img = cv2.imread(os.path.join(self.data_dir, "cam1","data", right_img_path), cv2.IMREAD_GRAYSCALE)
+            if left_img is None or right_img is None:
+                continue
             self.image_size = (left_img.shape[1], left_img.shape[0])  # (width, height)
             rectified_left, rectified_right = self.rectify_stereo_images(left_img, right_img)
             if rectified_left is None or rectified_right is None:

@@ -62,6 +62,7 @@ class FrontendResult:
     observations: List
     new_landmarks_3d: Dict
     loop_candidates: List
+    median_displacement: float = 0.0
 
 
 # Sentinel to signal frontend completion
@@ -156,7 +157,7 @@ def frontend_worker(
 
         # Heavy computation: SuperPoint + LightGlue + KLT + triangulation
         t0 = time.perf_counter()
-        observations, new_landmarks_3d, loop_candidates = (
+        observations, new_landmarks_3d, loop_candidates, median_displacement = (
             feature_pipeline.process_stereo_frame2(
                 left_img, right_img, R_prev_curr=R_prev_curr
             )
@@ -172,6 +173,7 @@ def frontend_worker(
             observations=observations,
             new_landmarks_3d=new_landmarks_3d,
             loop_candidates=loop_candidates,
+            median_displacement=median_displacement,
         )
 
         # Block until backend is ready (queue maxsize=2 provides backpressure)
@@ -220,8 +222,8 @@ def main():
     imu_calib = IMUCalibration(
         accel_bias=accel_bias_init,
         gyro_bias=gyro_bias_init,
-        accel_noise=2.0e-3 * 5,
-        gyro_noise=(1.6968e-4) * 5,  # 5x datasheet
+        accel_noise=2.0e-3 * 2,
+        gyro_noise=(1.6968e-4) * 2,  # 5x datasheet
     )
     imu_pipeline = IMUPipeline(imu_calib)
     optimizer = GraphOptimizer(
@@ -271,7 +273,7 @@ def main():
     # --- 2. Launch Frontend Thread ---
     # =================================================================
     frame_step = 10
-    start_frame = 40 * frame_step
+    start_frame = 40 * frame_step 
     loop_closure_start_frame = 10
     use_imu_for_flow = False
     imu_flow_error_threshold = 2.0
@@ -307,6 +309,35 @@ def main():
     R_cam_body = T_cam_body[:3, :3]
     R_body_cam = data_manager.T_imu_cam0[:3, :3]
 
+    # --- Gating analysis log: per-state geometry (parallax) vs. conditioning ---
+    import csv
+    gating_log_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "gating_analysis_log.csv"
+    )
+    gating_log_file = open(gating_log_path, "w", newline="")
+    gating_writer = csv.writer(gating_log_file)
+    gating_writer.writerow([
+        "frame_idx", "timestamp", "n_observations", "n_imu_samples",
+        "median_pixel_disp", "parallax_max_deg", "parallax_median_deg", "parallax_count",
+        "cov_trace", "cov_eig0", "cov_eig1", "cov_eig2", "condition_number",
+        "degenerate", "motion_type", "avg_error_per_factor", "total_error", "n_factors",
+    ])
+
+    # --- Keyframe gating + initialization state ---
+    kf_idx = 0                  # graph index of the last committed keyframe (X(0) = initial state)
+    last_bias = initial_bias    # bias of the most recent keyframe (used for predict + preint reset)
+    accumulated_disp = 0.0      # median pixel parallax accumulated since the last keyframe
+    accumulated_imu = 0         # IMU samples integrated since the last keyframe
+    imu_count_this_kf = 0       # IMU count of the keyframe interval just committed (for viz)
+    init_done = False           # becomes True once the graph covariance stabilizes
+    cov_trace_window = []       # recent position-covariance traces (init stability window)
+    INIT_STABLE_WINDOW = 5      # keyframes of stable covariance required to finish init
+    INIT_STABLE_REL_STD = 0.002  # relative std (std/mean) threshold for "stable"
+    KF_DISP_THRESHOLD = 20.0    # px of accumulated parallax to trigger a keyframe (tunable)
+
+    # Preintegration accumulates from the initial bias until the first keyframe commits.
+    imu_pipeline.preint.reset(initial_bias.accelerometer(), initial_bias.gyroscope())
+
     while True:
         # Pull next frontend result (blocks until available)
         result = result_queue.get()
@@ -329,9 +360,12 @@ def main():
         if P1 is None:
             P1 = data_manager.P1[:3, :3]
 
-        # --- A. IMU Preintegration ---
+        # --- A. IMU Preintegration (accumulate across skipped frames) ---
+        # Integrate this frame's IMU window onto the running preintegration WITHOUT
+        # resetting, so a single IMU factor can span the whole keyframe-to-keyframe
+        # interval. The accumulator is reset only after a keyframe commits (or at kf 0).
         imu_samples = []
-        if i > 0 and prev_cam_timestamp is not None:
+        if prev_cam_timestamp is not None:
             for imu_row in data_manager.iter_imu_between(
                 prev_cam_timestamp, current_cam_timestamp
             ):
@@ -342,17 +376,13 @@ def main():
                         gyro=imu_row[["w_x", "w_y", "w_z"]].values.astype(float),
                     )
                 )
-
-            current_estimate = optimizer.get_current_estimate()
-            if current_estimate.exists(B(i - 1)):
-                last_bias = current_estimate.atConstantBias(B(i - 1))
-            else:
-                print(f"  No bias for frame {i-1}, using initial calibration")
-                last_bias = initial_bias
-
-            imu_pipeline.preint.reset(last_bias.accelerometer(), last_bias.gyroscope())
             imu_pipeline.preint.integrate(imu_samples)
-            print(f"  Integrated {len(imu_samples)} IMU samples.")
+            accumulated_imu += len(imu_samples)
+            print(
+                f"  Integrated {len(imu_samples)} IMU samples "
+                f"(accumulated {accumulated_imu} since last keyframe)."
+            )
+        prev_cam_timestamp = current_cam_timestamp
 
         # --- B. Frame 0: Buffer landmarks only ---
         if i == 0:
@@ -375,29 +405,54 @@ def main():
                 metrics=None,
                 gt_pose=get_gt_position(current_cam_timestamp),
             )
-            prev_cam_timestamp = current_cam_timestamp
+            imu_pipeline.preint.reset(last_bias.accelerometer(), last_bias.gyroscope())
+            accumulated_imu = 0
+            accumulated_disp = 0.0
             continue
 
-        # --- C. Add New State and Factors ---
+        # --- B2. Keyframe gating decision ---
+        # Accumulate visual parallax (median pixel displacement) since the last keyframe.
+        # During initialization every frame is a keyframe so the graph can gather enough
+        # constraints; once the backend covariance has stabilized (init_done), a frame is
+        # promoted to a keyframe only when the accumulated parallax crosses the threshold.
+        # Non-keyframes keep accumulating IMU and drop their visual observations.
+        accumulated_disp += float(result.median_displacement)
+        if init_done:
+            is_keyframe = accumulated_disp >= KF_DISP_THRESHOLD
+        else:
+            is_keyframe = True
+
+        if not is_keyframe:
+            print(
+                f"  [non-keyframe] accumulated_disp={accumulated_disp:.1f}px "
+                f"< {KF_DISP_THRESHOLD}px - IMU accumulated, visual dropped."
+            )
+            backend_ms = (time.perf_counter() - t_backend_start) * 1000
+            print(f"  Backend time: {backend_ms:.1f} ms")
+            continue
+
+        # --- C. Commit a new keyframe state and factors ---
+        prev_kf = kf_idx
+        kf_idx += 1
         current_estimate = optimizer.get_current_estimate()
-        last_pose = current_estimate.atPose3(X(i - 1))
-        last_vel = current_estimate.atVector(V(i - 1))
+        last_pose = current_estimate.atPose3(X(prev_kf))
+        last_vel = current_estimate.atVector(V(prev_kf))
         last_state = gtsam.NavState(last_pose, last_vel)
 
         predicted_state = imu_pipeline.preint.preint.predict(last_state, last_bias)
 
-        optimizer.add_state_variable(i, predicted_state, last_bias)
-        optimizer.add_imu_factor(imu_pipeline.preint.preint, i - 1, i)
+        optimizer.add_state_variable(kf_idx, predicted_state, last_bias)
+        optimizer.add_imu_factor(imu_pipeline.preint.preint, prev_kf, kf_idx)
 
         # Visual factors
         for lm_id, frame_id, uv in observations:
             lm_3d = new_landmarks_3d.get(lm_id, None)
             optimizer.add_landmark_observation(
-                landmark_id=lm_id, state_idx=i, uv=uv, K=P1, landmark_3d=lm_3d
+                landmark_id=lm_id, state_idx=kf_idx, uv=uv, K=P1, landmark_3d=lm_3d
             )
 
         # Loop closure factors
-        if loop_candidates and i >= loop_closure_start_frame:
+        if loop_candidates and kf_idx >= loop_closure_start_frame:
             current_est = optimizer.get_current_estimate()
             current_pose = predicted_state.pose()
             T_world_cam = current_pose.compose(
@@ -418,19 +473,19 @@ def main():
                     continue
                 lm_world = current_est.atPoint3(lm_key)
                 lm_cam = T_cam_world.transformFrom(gtsam.Point3(lm_world))
-                if lm_cam[2] <= 0.3:
+                if lm_cam[2] <= 0.2:
                     continue
                 uv = obs_by_lm.get(candidate_lm_id)
                 if uv is None:
                     continue
                 optimizer.add_loop_closure_observation(
-                    landmark_id=candidate_lm_id, state_idx=i, uv=uv
+                    landmark_id=candidate_lm_id, state_idx=kf_idx, uv=uv
                 )
                 added_loop_factors += 1
             if added_loop_factors > 0:
                 print(f"  + {added_loop_factors} LC reprojection factors added.")
-        elif loop_candidates and i < loop_closure_start_frame:
-            print(f"  Loop candidates deferred until frame {loop_closure_start_frame}.")
+        elif loop_candidates and kf_idx < loop_closure_start_frame:
+            print(f"  Loop candidates deferred until keyframe {loop_closure_start_frame}.")
 
         # --- D. Optimize ---
         optimizer.optimize()
@@ -447,8 +502,8 @@ def main():
         #     optimizer.filter_uncertain_landmarks(max_trace=3.0)
 
         # --- Covariance & Degeneracy ---
-        pos_cov = optimizer.get_position_covariance(i)
-        degeneracy = optimizer.detect_degeneracy(i)
+        pos_cov = optimizer.get_position_covariance(kf_idx)
+        degeneracy = optimizer.detect_degeneracy(kf_idx)
         if degeneracy["degenerate"]:
             eigs = degeneracy["position_eigenvalues"]
             print(f"  ⚠ DEGENERATE: {degeneracy['motion_type']}")
@@ -460,6 +515,61 @@ def main():
                 f"  Pose uncertainty (3σ): [{np.sqrt(eigs[0])*3:.3f}, {np.sqrt(eigs[1])*3:.3f}, {np.sqrt(eigs[2])*3:.3f}] m"
             )
 
+        # --- Initialization detection (graph covariance stability) ---
+        # Track the position-covariance trace across recent keyframes. Once it is stable
+        # (low relative spread) over INIT_STABLE_WINDOW keyframes, declare init complete
+        # and switch on keyframe gating.
+        if not init_done:
+            cov_trace_init = (
+                float(np.sum(degeneracy["position_eigenvalues"]))
+                if degeneracy["position_eigenvalues"] is not None
+                else None
+            )
+            if cov_trace_init is not None and np.isfinite(cov_trace_init):
+                cov_trace_window.append(cov_trace_init)
+                if len(cov_trace_window) > INIT_STABLE_WINDOW:
+                    cov_trace_window.pop(0)
+                if len(cov_trace_window) == INIT_STABLE_WINDOW:
+                    w = np.asarray(cov_trace_window, dtype=float)
+                    rel_std = float(w.std() / max(w.mean(), 1e-12))
+                    if rel_std < INIT_STABLE_REL_STD:
+                        init_done = True
+                        print(
+                            f"  ** INIT COMPLETE: covariance stable (rel_std={rel_std:.3f} "
+                            f"over {INIT_STABLE_WINDOW} keyframes). Keyframe gating ENABLED "
+                            f"(threshold {KF_DISP_THRESHOLD}px)."
+                        )
+                    else:
+                        print(
+                            f"  Init: cov_trace rel_std={rel_std:.3f} "
+                            f"(need < {INIT_STABLE_REL_STD})."
+                        )
+
+        # --- Gating analysis logging (geometry vs. conditioning) ---
+        para_stats = optimizer.drain_parallax_stats()
+        cond_num = degeneracy.get("condition_number", float("nan"))
+        eigs_log = degeneracy.get("position_eigenvalues")
+        if eigs_log is not None:
+            cov_trace = float(np.sum(eigs_log))
+            eig0, eig1, eig2 = float(eigs_log[0]), float(eigs_log[1]), float(eigs_log[2])
+        else:
+            cov_trace = eig0 = eig1 = eig2 = float("nan")
+        gating_writer.writerow([
+            i, current_cam_timestamp, len(observations), accumulated_imu,
+            f"{accumulated_disp:.4f}",
+            f"{para_stats['parallax_max_deg']:.4f}",
+            f"{para_stats['parallax_median_deg']:.4f}",
+            para_stats["parallax_count"],
+            f"{cov_trace:.8f}", f"{eig0:.8f}", f"{eig1:.8f}", f"{eig2:.8f}",
+            f"{cond_num:.4f}",
+            int(bool(degeneracy.get("degenerate", False))),
+            degeneracy.get("motion_type", ""),
+            f"{metrics['avg_error_per_factor']:.6f}",
+            f"{metrics['total_error']:.6f}",
+            metrics["n_factors"],
+        ])
+        gating_log_file.flush()
+
         # --- Adaptive IMU-guided flow + update shared rotation for frontend ---
         prev_use_imu = use_imu_for_flow
         use_imu_for_flow = metrics["avg_error_per_factor"] < imu_flow_error_threshold
@@ -467,19 +577,28 @@ def main():
             status = "ENABLED" if use_imu_for_flow else "DISABLED"
             print(f"  ** IMU-guided optical flow {status}")
 
-        # Compute R_prev_curr for the frontend (one-frame latency)
-        # This rotation will be used by the frontend for frame i+1 (or i+2 depending on queue state)
-        if use_imu_for_flow and len(imu_samples) > 0:
+        # Compute R_prev_curr for the frontend from the accumulated keyframe-interval
+        # rotation (one-frame latency). Done BEFORE resetting the preintegration below.
+        if use_imu_for_flow and accumulated_imu > 0:
             R_body = imu_pipeline.preint.preint.deltaRij().matrix()
             r_prev_curr_holder[0] = R_cam_body @ R_body @ R_body_cam
         else:
             r_prev_curr_holder[0] = None
 
+        # --- Update bias and reset preintegration for the next keyframe interval ---
+        est_after = optimizer.get_current_estimate()
+        if est_after is not None and est_after.exists(B(kf_idx)):
+            last_bias = est_after.atConstantBias(B(kf_idx))
+        imu_pipeline.preint.reset(last_bias.accelerometer(), last_bias.gyroscope())
+        imu_count_this_kf = accumulated_imu
+        accumulated_imu = 0
+        accumulated_disp = 0.0
+
         # --- ATE ---
         ate_rmse_current = None
         current_est_for_ate = optimizer.get_current_estimate()
-        if current_est_for_ate is not None and current_est_for_ate.exists(X(i)):
-            est_pos = current_est_for_ate.atPose3(X(i)).translation()
+        if current_est_for_ate is not None and current_est_for_ate.exists(X(kf_idx)):
+            est_pos = current_est_for_ate.atPose3(X(kf_idx)).translation()
             ate_est_positions.append(np.array([est_pos[0], est_pos[1], est_pos[2]]))
             ate_gt_positions.append(get_gt_position(current_cam_timestamp))
             if len(ate_est_positions) >= 3:
@@ -492,9 +611,9 @@ def main():
 
         # --- E. Visualize ---
         lc_ids = []
-        if loop_candidates and i >= loop_closure_start_frame:
+        if loop_candidates and kf_idx >= loop_closure_start_frame:
             vis_est = optimizer.get_current_estimate()
-            vis_pose = vis_est.atPose3(X(i))
+            vis_pose = vis_est.atPose3(X(kf_idx))
             T_world_cam_vis = vis_pose.compose(
                 gtsam.Pose3(
                     gtsam.Rot3(data_manager.T_imu_cam0[:3, :3]),
@@ -514,15 +633,15 @@ def main():
                         lc_ids.append(cid)
 
         visualizer.update(
-            frame_idx=i,
+            frame_idx=kf_idx,
             left_img=left_img,
             right_img=right_img,
             observations=observations,
             new_landmarks_3d=new_landmarks_3d,
             all_landmarks=feature_pipeline.landmarks,
             gtsam_estimate=optimizer.get_current_estimate(),
-            num_states=i + 1,
-            imu_samples_count=len(imu_samples),
+            num_states=kf_idx + 1,
+            imu_samples_count=imu_count_this_kf,
             metrics=metrics,
             loop_closure_ids=lc_ids,
             gt_pose=get_gt_position(current_cam_timestamp),
@@ -533,10 +652,11 @@ def main():
         backend_ms = (time.perf_counter() - t_backend_start) * 1000
         print(f"  Backend time: {backend_ms:.1f} ms")
 
-        prev_cam_timestamp = current_cam_timestamp
-
     # --- Wait for frontend to finish ---
     frontend_thread.join()
+
+    gating_log_file.close()
+    print(f"Gating analysis log saved to {gating_log_path}")
 
     # --- Final Trajectory Error Summary ---
     if len(ate_est_positions) >= 3:
