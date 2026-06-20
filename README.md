@@ -189,16 +189,28 @@ Absolute Trajectory Error after SE(3) Umeyama alignment on **MH_01_easy** (328 f
 
 > **Note:** The graph is initialized with identity SE(3) pose and zero velocity/bias — high max error reflects early convergence stages.
 
+### Trajectory Evaluation Results
+
+#### Absolute Trajectory Error (ATE)
 | Metric | Value |
-|--------|-------|
-| **RMSE** | 0.886 m |
-| Mean | 0.303 m |
-| Median | 0.175 m |
-| Max | 10.189 m |
-| Std | 0.833 m |
+| :--- | :--- |
+| **RMSE** | 0.5814 m |
+| **Mean** | 0.3498 m |
+| **Median** | 0.2809 m |
+| **Max** | 6.6314 m |
+| **Std** | 0.4644 m |
+| **Frames** | 328 |
 
+#### Relative Trajectory Error (RTE)
+| Metric | Value |
+| :--- | :--- |
+| **RMSE** | 0.4795 m |
+| **Mean** | 0.1356 m |
+| **Median** | 0.0668 m |
+| **Max** | 6.1195 m |
+| **Std** | 0.4599 m |
 
-The Rerun viewer launches automatically. Processing logs are printed to the terminal with per-frame diagnostics including graph size, optimization error, and tracking statistics.
+> The Rerun viewer launches automatically. Processing logs are printed to the terminal with per-frame diagnostics including graph size, optimization error, and tracking statistics.
 
 ---
 
