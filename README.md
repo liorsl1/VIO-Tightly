@@ -1,5 +1,5 @@
 # Tightly-Coupled Visual-Inertial Odometry (VIO)
-
+#### ( This is the **_Simpler_** version of the project - an improved version with stronger implementation lies in the **direct-method** branch. )
 A real-time stereo visual-inertial odometry system using factor graph optimization (GTSAM ISAM2) with explicit landmark management, loop closure detection, and live 3D visualization.
 
 ![Pipeline](https://img.shields.io/badge/Backend-GTSAM_ISAM2-blue) ![Features](https://img.shields.io/badge/Frontend-SuperPoint+LightGlue-green) ![Viz](https://img.shields.io/badge/Viz-Rerun-orange)
