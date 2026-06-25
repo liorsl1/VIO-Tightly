@@ -1,6 +1,6 @@
 # VIO-Tightly — Tightly-Coupled Visual-Inertial SLAM
 
-A real-time stereo visual-inertial odometry system using factor graph optimization (GTSAM/ISAM2) with explicit landmark management, keyframe-based graph growth, loop closure detection, and live 3D visualization.
+A real-time stereo visual-inertial odometry system, working in a Direct-Method (No feature-matching, minimization of photometric error with KLT) using factor graph optimization (GTSAM/ISAM2) with explicit landmark management, keyframe-based graph growth, loop closure detection, and live 3D visualization.
 
 ![Pipeline](https://img.shields.io/badge/Backend-GTSAM_ISAM2-blue) ![Features](https://img.shields.io/badge/Frontend-XFeat-green) ![Viz](https://img.shields.io/badge/Viz-Rerun-orange)
 
