@@ -35,8 +35,8 @@ import numpy as np
 import yaml
 import pandas as pd
 from scipy.spatial.transform import Rotation as R
-from threading import Thread, Event
-from queue import Queue
+from threading import Thread
+from queue import Queue, Empty
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple, Any
 import time
@@ -69,6 +69,26 @@ class FrontendResult:
 
 # Sentinel to signal frontend completion
 _FRONTEND_DONE = None
+
+
+@dataclass
+class VisFrame:
+    """All data the visualization thread needs for one frame."""
+    frame_idx: int
+    left_img: np.ndarray
+    right_img: np.ndarray
+    observations: List
+    new_landmarks_3d: Dict
+    all_landmarks: Dict  # snapshot of feature_pipeline.landmarks
+    gtsam_estimate: Any  # GTSAM Values (already a copy from get_current_estimate)
+    num_states: int
+    imu_samples_count: int
+    metrics: Optional[Dict]
+    loop_closure_ids: List
+    gt_pose: Optional[np.ndarray]
+    pose_covariance: Optional[np.ndarray]
+    ate_rmse: Optional[float]
+
 
 
 def compute_ate(est_positions, gt_positions):
@@ -130,6 +150,64 @@ def compute_rte(est_positions, gt_positions, delta=4):
     return rte_rmse, rte_errors
 
 
+def vis_worker(
+    visualizer: VIOVisualizer,
+    vis_queue: Queue,
+):
+    """Visualization thread: pulls VisFrame objects from queue and logs to Rerun.
+
+    Always processes the latest frame, dropping stale ones if the backend
+    outruns visualization.
+    """
+
+    while True:
+        # Get the next frame (blocking)
+        try:
+            vis_data = vis_queue.get(timeout=2.0)
+        except Empty:
+            continue
+
+        if vis_data is None:  # Sentinel: shutdown
+            break
+
+        # Drain queue to get the latest frame (drop stale ones)
+        while True:
+            try:
+                newer = vis_queue.get_nowait()
+            except Empty:
+                break
+            if newer is None:  # Sentinel found while draining
+                vis_data = None
+                break
+            vis_data = newer
+
+        if vis_data is None:
+            break
+
+        # --- Regular Rerun visualization ---
+        try:
+            visualizer.update(
+                frame_idx=vis_data.frame_idx,
+                left_img=vis_data.left_img,
+                right_img=vis_data.right_img,
+                observations=vis_data.observations,
+                new_landmarks_3d=vis_data.new_landmarks_3d,
+                all_landmarks=vis_data.all_landmarks,
+                gtsam_estimate=vis_data.gtsam_estimate,
+                num_states=vis_data.num_states,
+                imu_samples_count=vis_data.imu_samples_count,
+                metrics=vis_data.metrics,
+                loop_closure_ids=vis_data.loop_closure_ids,
+                gt_pose=vis_data.gt_pose,
+                pose_covariance=vis_data.pose_covariance,
+                ate_rmse=vis_data.ate_rmse,
+            )
+        except Exception as e:
+            print(f"  [Vis] Error: {e}")
+
+
+
+
 def frontend_worker(
     feature_pipeline: vFeature,
     data_manager: DataManager,
@@ -186,7 +264,8 @@ def frontend_worker(
 
 
 def main():
-    data_dir = "/home/liorsl/Self/datasets/MH_01_easy/MH_01_easy/mav0"
+    data_dir = "f:/Code/exercise_10/data/MH_01_easy/mav0"
+    # "/home/liorsl/Self/datasets/MH_01_easy/MH_01_easy/mav0"
     if not os.path.exists(data_dir):
         print(f"Data directory {data_dir} does not exist.")
         return
@@ -287,6 +366,9 @@ def main():
     # Queue with maxsize=2: allows frontend to be 1 frame ahead, blocks if backend is slow
     result_queue = Queue(maxsize=2)
 
+    # Visualization queue: maxsize=3 so backend never blocks; vis thread drains to latest
+    vis_queue = Queue(maxsize=2)
+
     frontend_thread = Thread(
         target=frontend_worker,
         args=(
@@ -301,6 +383,15 @@ def main():
     )
     frontend_thread.start()
     print("Frontend thread started.")
+
+    # --- Combined Visualization Thread ---
+    vis_thread = Thread(
+        target=vis_worker,
+        args=(visualizer, vis_queue),
+        daemon=True,
+    )
+    vis_thread.start()
+    print("Visualization thread started.")
 
     # =================================================================
     # --- 3. Backend Loop (Main Thread) ---
@@ -611,7 +702,7 @@ def main():
                     f"  ATE (RMSE): {ate_rmse_current:.4f} m | Frame error: {ate_errors[-1]:.4f} m"
                 )
 
-        # --- E. Visualize ---
+        # --- E. Enqueue visualization (non-blocking, offloads to vis thread) ---
         lc_ids = []
         if loop_candidates and kf_idx >= loop_closure_start_frame:
             vis_est = optimizer.get_current_estimate()
@@ -634,13 +725,13 @@ def main():
                     if lm_cam[2] > 0.3:
                         lc_ids.append(cid)
 
-        visualizer.update(
+        vis_frame = VisFrame(
             frame_idx=kf_idx,
             left_img=left_img,
             right_img=right_img,
             observations=observations,
             new_landmarks_3d=new_landmarks_3d,
-            all_landmarks=feature_pipeline.landmarks,
+            all_landmarks=dict(feature_pipeline.landmarks),
             gtsam_estimate=optimizer.get_current_estimate(),
             num_states=kf_idx + 1,
             imu_samples_count=imu_count_this_kf,
@@ -651,8 +742,22 @@ def main():
             ate_rmse=ate_rmse_current,
         )
 
+        # Non-blocking put: if queue is full, drop oldest to keep backend fast
+        try:
+            vis_queue.put_nowait(vis_frame)
+        except:
+            try:
+                vis_queue.get_nowait()  # drop oldest
+            except Empty:
+                pass
+            vis_queue.put_nowait(vis_frame)
+
         backend_ms = (time.perf_counter() - t_backend_start) * 1000
         print(f"  Backend time: {backend_ms:.1f} ms")
+
+    # --- Stop visualization thread ---
+    vis_queue.put(None)  # Sentinel to stop vis_worker
+    vis_thread.join(timeout=10.0)
 
     # --- Wait for frontend to finish ---
     frontend_thread.join()

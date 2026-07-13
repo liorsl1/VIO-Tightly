@@ -1,7 +1,7 @@
 import numpy as np
 import cv2
 import torch
-from lightglue import LightGlue, SuperPoint
+# from lightglue import LightGlue, SuperPoint
 from collections import defaultdict
 import plotly.graph_objects as go
 import plotly.io as pio

@@ -300,8 +300,8 @@ class DataManager:
             # print("Image size:", self.image_size)
             # print("R1:\n", R1)
             # print("R2:\n", R2)
-            print("P1:\n", P1)
-            print("P2:\n", P2)
+            # print("P1:\n", P1)
+            # print("P2:\n", P2)
             self.P1 = P1  # Rectified projection matrix for cam0
             self.P2 = P2  # Rectified projection matrix for cam1
             self.R1 = R1  # Rectification rotation for cam0
