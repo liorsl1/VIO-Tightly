@@ -1,22 +1,24 @@
 """
 Tightly-Coupled VIO — Frontend/Backend Threaded Architecture.
 
-Frontend thread: stereo feature processing (SuperPoint, LightGlue, KLT, triangulation)
-Backend thread (main): IMU preintegration, factor graph optimization, visualization
+Frontend thread: stereo feature processing (XFeat, KLT, loop candidates) and
+median displacement estimation for keyframe gating.
+Backend thread (main): IMU preintegration, keyframe-gated factor graph optimization,
+covariance-based init, and visualization.
 
-The frontend runs one frame ahead of the backend. IMU-guided optical flow uses
-the rotation from the *previous* backend optimization (one-frame latency).
+The frontend runs one frame ahead of the backend. IMU-guided optical flow uses the
+rotation from the previous backend optimization (one-frame latency).
 --------------------------------------------------------------------------
 Frontend Thread                          Backend Thread (main)
 ─────────────────                        ─────────────────────
 Frame i+1:                               Frame i:
   • Read stereo images                     • IMU preintegration
-  • SuperPoint extraction                  • Factor graph update
-  • LightGlue stereo matching              • ISAM2 optimize
-  • KLT optical flow                       • Covariance / degeneracy
-  • Triangulation                          • ATE computation
-  • Loop closure candidates                • Rerun visualization
-         │                                        │
+  • XFeat / stereo matching                • Keyframe decision (disp threshold)
+  • KLT optical flow                       • Add state + IMU factor
+  • Triangulation                          • Add visual / loop factors
+  • Median displacement                    • ISAM2 optimize
+  • Loop closure candidates                • Covariance / degeneracy
+         │                                        • Gating analysis logging
          └──── Queue(maxsize=2) ──────────────────┘
                                                   │
                                     r_prev_curr_holder[0] ← R from IMU
