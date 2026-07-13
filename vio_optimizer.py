@@ -80,10 +80,12 @@ class GraphOptimizer:
         self.prior_bias_noise = gtsam.noiseModel.Diagonal.Sigmas(
             np.array([0.01, 0.01, 0.01, 0.003, 0.003, 0.003])
         )
-        # Landmark regularization prior (sigma=1.5m).
+        # Landmark regularization prior (sigma in meters).
         # Tight enough to prevent ISAM2 from pushing landmarks to degenerate positions
         # during relinearization, but loose enough not to bias converged estimates.
-        self.landmark_regularization_noise = gtsam.noiseModel.Isotropic.Sigma(3, 1.5)
+        # Tunable at runtime via self.landmark_reg_sigma — the noise model is rebuilt
+        # on each landmark promotion to reflect the current setting.
+        self.landmark_reg_sigma = 1.5  # meters — can be changed by RL agent
 
         # Robust pixel noise (Huber) for projection factors
         pixel_sigma = 1  # pixels
@@ -106,6 +108,9 @@ class GraphOptimizer:
         # Spatial distribution: grid bucketing (cell_size in pixels)
         self.obs_cell_size = 13  # pixels — one observation per 13x13 cell per frame
         self._frame_occupied_cells = {}  # {state_idx: set of (row, col) tuples}
+
+        # Tunable thresholds (can be changed at runtime by RL agent)
+        self.parallax_threshold = 2.5  # degrees — minimum parallax for landmark promotion
 
         # Minimum incremental parallax (deg) required to add a new observation factor to
         # an already-initialized landmark. A re-observation whose camera has barely moved
@@ -351,10 +356,8 @@ class GraphOptimizer:
 
         # Validate: minimum parallax angle between observing poses
         max_parallax = self._max_parallax_deg(pt3_world, buf["observations"])
-        # record every promotion attempt's parallax (incl. rejected ones)
-        self.parallax_log.append(max_parallax)
-        if max_parallax < 5:
-            # Not enough parallax yet — keep in buffer for later retry
+        if max_parallax < self.parallax_threshold:
+            print(f"  Rejecting landmark {landmark_id} due to low parallax ({max_parallax:.1f}°)")
             return
 
         # Validate: landmark must be in front of ALL observing cameras
@@ -384,11 +387,13 @@ class GraphOptimizer:
         self.landmark_obs_count[landmark_id] = 0
 
         # Regularization prior to prevent indeterminate linear system
+        # Uses current landmark_reg_sigma (tunable by RL agent at runtime)
+        reg_noise = gtsam.noiseModel.Isotropic.Sigma(3, self.landmark_reg_sigma)
         self.graph.add(
             gtsam.PriorFactorPoint3(
                 L(landmark_id),
                 gtsam.Point3(*pt3_world),
-                self.landmark_regularization_noise,
+                reg_noise,
             )
         )
 
