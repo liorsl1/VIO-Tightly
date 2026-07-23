@@ -91,14 +91,16 @@ class IMUPreintegrator:
     def integrate(self, samples: List[IMUSample]):
         if gtsam is None or self.preint is None:
             return
-        for i, s in enumerate(samples):
+        for s in samples:
             if self.start_time is None:
                 self.start_time = s.t
-            if i > 0:
-                dt = s.t - samples[i - 1].t
-                if dt <= 0 or dt > 1.0:  # basic sanity
-                    continue
-                self.preint.integrateMeasurement(s.accel, s.gyro, dt)
+                self.end_time = s.t
+                continue
+            dt = s.t - self.end_time
+            if dt <= 0 or dt > 1.0:  # basic sanity
+                self.end_time = s.t
+                continue
+            self.preint.integrateMeasurement(s.accel, s.gyro, dt)
             self.end_time = s.t
 
     def get_factor_and_bias(self, state_i, state_j, bias_key):

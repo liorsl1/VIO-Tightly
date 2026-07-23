@@ -56,6 +56,7 @@ class vFeature:
         self.hnsw_inited = False
         self.hnsw_space = 'l2'       # or 'cosine'
         self.hnsw_new_buffer = []    # (landmark_id, descriptor)
+        self.lc_matched_frames = []  # [(frame_idx, vote_count), ...] from query_similar_frames
         self.landmark_desc = {}      # landmark_id -> running mean descriptor (np.float32, shape (D,))
         self.landmark_desc_counts = {}  # landmark_id -> num updates
         self.landmark_last_frame = {}   # landmark_id -> last seen frame
@@ -147,9 +148,9 @@ class vFeature:
         #print(disparity, vertical_error, errors.mean())
         # Filter based on reasonable disparity and epipolar constraint
         valid_matches = np.logical_and.reduce([
-            disparity > 0,  # Positive disparity
-            disparity < 30,  # Reasonable disparity limit
-            vertical_error < 2.0  # Tight epipolar constraint
+            disparity > 0.1,  # Positive disparity
+            disparity < 110,  # Reasonable disparity limit
+            vertical_error < 1.0  # Tight epipolar constraint
         ])
 
         return valid_matches
@@ -451,6 +452,194 @@ class vFeature:
         
         return landmark_ids
 
+
+    # ==================== GEOMETRIC OUTLIER REJECTION ====================
+
+    def geometric_outlier_rejection_2pt(
+        self, prev_pts, curr_pts, R_prev_curr, K,
+        ransac_iters=100, ransac_threshold=1.0, min_inliers=8
+    ):
+        """2-point RANSAC for translation-only estimation given known rotation.
+        Using the epipolar constraint for a calibrated camera pair is:
+
+            p2^T · E · p1 = 0
+
+        where E = [t]× R is the essential matrix, p1/p2 are *normalized* bearing
+        vectors (K^-1 · pixel), R is the rotation, and t is the translation.
+
+        When R is known from IMU preintegration, the only unknown is the
+        translation direction t (2 DOF — unit vector up to sign).  We can
+        rearrange the epipolar constraint:
+
+            p2^T · [t]× · (R · p1) = 0
+            ⟺  t · (p2 × (R · p1)) = 0            (scalar triple product)
+
+        Let q_i = p2_i × (R · p1_i).  Then each correspondence gives one
+        linear constraint:  t^T · q_i = 0.
+
+        With 2 correspondences we get a 2×3 homogeneous system; t lies in its
+        1-dimensional null space (found via SVD).  This is a *minimal solver*.
+
+        RANSAC loop
+        -----------
+        1. Sample 2 correspondences, solve for t via SVD null space.
+        2. Score ALL correspondences by Sampson distance (first-order
+           approximation to geometric reprojection error in pixels):
+
+               Sampson(i) = (p2^T E p1)^2 / (||E p1||^2_{1:2} + ||E^T p2||^2_{1:2})
+
+           This is cheaper than full reprojection and a tight approximation
+           when the error is small (which it is for inliers).
+        3. Keep the t with the most inliers (Sampson < threshold²).
+        4. Mark features with Sampson ≥ threshold² as outliers.
+
+        Args:
+            prev_pts:  (N, 2) pixel coordinates in the previous (reference) frame.
+            curr_pts:  (N, 2) pixel coordinates in the current frame.
+            R_prev_curr: 3×3 rotation matrix from previous to current camera frame.
+            K:         3×3 upper-triangular camera intrinsic matrix.
+            ransac_iters:     Number of RANSAC iterations (default 100).
+            ransac_threshold: Inlier threshold in pixels for Sampson distance
+                              (default 1.0 px).
+            min_inliers:      Minimum number of inliers to accept a solution.
+
+        Returns:
+            inlier_mask: (N,) boolean array — True for inliers, False for outliers.
+        """
+        N = len(prev_pts)
+        if N < 2:
+            return np.ones(N, dtype=bool)
+
+        # Convert pixel coordinates to normalized bearing vectors ---
+        # p = K^-1 · [u, v, 1]^T  →  bearing vector in camera frame
+        K_inv = np.linalg.inv(K)
+        ones = np.ones((N, 1))
+        prev_h = np.hstack([prev_pts, ones])  # (N, 3) homogeneous pixels
+        curr_h = np.hstack([curr_pts, ones])
+
+        # Normalized coordinates (bearing vectors, not unit-length but in camera frame)
+        prev_norm = (K_inv @ prev_h.T).T  # (N, 3)
+        curr_norm = (K_inv @ curr_h.T).T  # (N, 3)
+
+        # Precompute rotated reference bearings ---
+        # R rotates from prev camera to curr camera, so:
+        #   q_i = curr_norm_i × (R · prev_norm_i)
+        R = R_prev_curr
+        rotated_prev = (R @ prev_norm.T).T  # (N, 3)
+
+        # q_i = p2_i × (R · p1_i)  — the vector each correspondence constrains t against
+        q = np.cross(curr_norm, rotated_prev)  # (N, 3)
+
+        # Precompute terms for Sampson distance scoring ---
+        # For a candidate E = [t]× R, the Sampson distance for correspondence i is:
+        #   numerator   = (p2^T E p1)^2
+        #   denominator = ||E p1||^2_{first 2 components} + ||E^T p2||^2_{first 2 components}
+        #
+        # We precompute E·p1 and E^T·p2 per-candidate inside the loop,
+        # but cache R·p1 (= rotated_prev) and p2 (= curr_norm) here.
+
+        # Sampson threshold squared (in normalized coordinates)
+        # Convert pixel threshold to normalized coordinates:
+        # A 1px error in pixel space ≈ 1/f error in normalized space.
+        fx, fy = K[0, 0], K[1, 1]
+        norm_threshold = ransac_threshold / min(fx, fy)
+        norm_threshold_sq = norm_threshold ** 2
+
+        best_inlier_count = 0
+        best_inlier_mask = np.zeros(N, dtype=bool)
+
+        rng = np.random.default_rng()
+
+        for _ in range(ransac_iters):
+            # Sample 2 correspondences, solve for t ---
+            idx = rng.choice(N, size=2, replace=False)
+            Q = q[idx]  # (2, 3)
+
+            # t lies in null space of Q (2×3 matrix, rank ≤ 2 → 1D null space)
+            _, S, Vt = np.linalg.svd(Q)
+            t_candidate = Vt[-1]  # Last row of V^T = smallest singular vector
+
+            # Degenerate check: if the two constraints are nearly parallel,
+            # the null space is poorly defined — skip this sample
+            if len(S) >= 2 and S[-1] > 0.1 * S[0]:
+                continue  # Rank is too high — constraints don't define a unique t
+
+            # Score all correspondences via Sampson distance ---
+            # E = [t]× R
+            tx, ty, tz = t_candidate
+            t_skew = np.array([[0, -tz, ty],
+                               [tz, 0, -tx],
+                               [-ty, tx, 0]])
+            E = t_skew @ R
+
+            # Epipolar error: e_i = p2_i^T · E · p1_i  (scalar per correspondence)
+            Ep1 = (E @ prev_norm.T).T      # (N, 3)  — E · p1
+            ETp2 = (E.T @ curr_norm.T).T   # (N, 3)  — E^T · p2
+            epipolar_err = np.sum(curr_norm * Ep1, axis=1)  # (N,) — p2^T · E · p1
+
+            # Sampson distance squared (in normalized coordinates):
+            #   d² = (p2^T E p1)² / (||Ep1||²_{0:2} + ||E^Tp2||²_{0:2})
+            denom = (Ep1[:, 0]**2 + Ep1[:, 1]**2 +
+                     ETp2[:, 0]**2 + ETp2[:, 1]**2)
+            denom = np.maximum(denom, 1e-12)  # avoid division by zero
+            sampson_sq = (epipolar_err ** 2) / denom
+
+            inlier_mask = sampson_sq < norm_threshold_sq
+            n_inliers = inlier_mask.sum()
+
+            if n_inliers > best_inlier_count:
+                best_inlier_count = n_inliers
+                best_inlier_mask = inlier_mask.copy()
+
+        n_outliers = N - best_inlier_count
+        if best_inlier_count < min_inliers:
+            # RANSAC failed to find a good model — don't reject anything,
+            # let the backend's robust cost function handle it
+            print(f"  [2pt-RANSAC] FAILED: only {best_inlier_count}/{N} inliers "
+                  f"(need {min_inliers}). Keeping all features.")
+            return np.ones(N, dtype=bool)
+
+        print(f"  [2pt-RANSAC] {best_inlier_count}/{N} inliers, "
+              f"{n_outliers} outliers rejected (threshold={ransac_threshold:.1f}px)")
+        return best_inlier_mask
+
+    def geometric_outlier_rejection_5pt(self, prev_pts, curr_pts, K, ransac_threshold=1.0):
+        """5-point RANSAC fallback when IMU rotation is unavailable.
+
+        Uses OpenCV's findEssentialMat which implements Nistér's 5-point algorithm
+        inside a RANSAC loop. This estimates the full essential matrix (both R and t)
+        from 2D-2D correspondences, requiring 5 point pairs as the minimal set.
+
+        Less efficient than 2-point (more samples needed, 5 DOF vs 2 DOF) but
+        works without any IMU prior.
+
+        Args:
+            prev_pts:  (N, 2) pixel coordinates in the previous frame.
+            curr_pts:  (N, 2) pixel coordinates in the current frame.
+            K:         3×3 camera intrinsic matrix.
+            ransac_threshold: Inlier threshold in pixels (default 1.0).
+
+        Returns:
+            inlier_mask: (N,) boolean array — True for inliers.
+        """
+        N = len(prev_pts)
+        if N < 5:
+            return np.ones(N, dtype=bool)
+
+        E, mask = cv2.findEssentialMat(
+            prev_pts, curr_pts, K,
+            method=cv2.RANSAC,
+            prob=0.999,
+            threshold=ransac_threshold,
+        )
+        if mask is None:
+            return np.ones(N, dtype=bool)
+
+        inlier_mask = mask.ravel().astype(bool)
+        n_inliers = inlier_mask.sum()
+        print(f"  [5pt-RANSAC] {n_inliers}/{N} inliers, "
+              f"{N - n_inliers} outliers rejected (threshold={ransac_threshold:.1f}px)")
+        return inlier_mask
 
     def track_features_temporal(self, prev_frame, curr_frame, prev_keypoints, R_prev_curr=None):
         """
@@ -849,15 +1038,36 @@ class vFeature:
                 self.prev_frame, left_img, self.prev_keypoints, R_prev_curr=R_prev_curr
             )
 
-            # --- Keyframe gating: insufficient parallax since last keyframe ---
-            # Skip this frame: keep prev_frame/keypoints/track_ids UNCHANGED so the next
-            # frame measures parallax from the SAME keyframe (parallax accumulates until
-            # it crosses the threshold). Return empty observations/landmarks/loop_candidates
-            # so the backend adds no projection factors for this static frame.
-            # if median_displacement < self.min_tracked_dist:
-            #     print(f"  [SKIP frame {self.current_frame_id}] parallax "
-            #           f"{median_displacement:.2f}px < {self.min_tracked_dist}px (no keyframe)")
-            #     return [], {}, []
+            # --- Geometric outlier rejection (RANSAC) ---
+            # After KLT + forward-backward consistency, apply epipolar RANSAC to
+            # remove features that are geometrically inconsistent.  This catches
+            # outliers that pass the FB check (e.g. features on moving objects,
+            # repetitive textures, or KLT drift on low-contrast edges).
+            #
+            # If IMU rotation is available  → 2-point RANSAC (translation-only)
+            # If IMU rotation is unavailable → 5-point RANSAC (full essential matrix)
+            if len(curr_tracked) >= 8:
+                # prev_keypoints corresponding to the valid KLT tracks
+                prev_matched = self.prev_keypoints[valid_mask]
+                K = self.P1[:3, :3]  # rectified intrinsic matrix
+
+                if R_prev_curr is not None:
+                    ransac_inliers = self.geometric_outlier_rejection_2pt(
+                        prev_matched, curr_tracked, R_prev_curr, K,
+                        ransac_iters=100, ransac_threshold=1.0,
+                    )
+                else:
+                    ransac_inliers = self.geometric_outlier_rejection_5pt(
+                        prev_matched, curr_tracked, K,
+                        ransac_threshold=1.0,
+                    )
+
+                # Apply RANSAC mask on top of the KLT-valid set
+                curr_tracked = curr_tracked[ransac_inliers]
+                # Update valid_mask: indices that were True now get further filtered
+                valid_indices = np.where(valid_mask)[0]
+                valid_mask = np.zeros_like(valid_mask)
+                valid_mask[valid_indices[ransac_inliers]] = True
 
             tracked_keypoints = curr_tracked
             tracked_landmark_ids = self.prev_track_ids[valid_mask]
@@ -1052,10 +1262,10 @@ class vFeature:
                 lc_descs = np.vstack(lc_desc_list)
                 min_gap = 9
                 loop_candidates = self.query_similar_landmarks(
-                    lc_descs, k=50, exclude_ids=current_lm_set, min_frame_gap=min_gap
+                    lc_descs, k=70, exclude_ids=current_lm_set, min_frame_gap=min_gap
                 )
                 candidates = self.query_similar_frames(
-                    lc_descs, k_landmarks=30, top_frames=3,
+                    lc_descs, k_landmarks=70, top_frames=3,
                     exclude_ids=current_lm_set, min_frame_gap=min_gap
                 )
                 self.lc_matched_frames = candidates

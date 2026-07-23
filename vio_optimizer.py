@@ -26,6 +26,12 @@ class GraphOptimizer:
             self.isam = None
             self.graph = None
             self.initial = None
+            self._depth_stats = {"attempted": 0, "promoted": 0, "outlier": 0, "pending": 0}
+            self.promoted_depth_log = []
+            self._static_promotion_done = False
+            self.landmark_buffer = {}
+            self.landmark_initialized = set()
+            self.landmark_obs_count = {}
             return
 
         self.imu_calib = imu_calib  # IMUCalibration for bias noise computation
@@ -42,17 +48,23 @@ class GraphOptimizer:
         self.isam_params = gtsam.ISAM2Params()
         # If I want to use Dogleg insead of standard Gauss-Newton, I can set these parameters:
         # dogleg_params = gtsam.ISAM2DoglegParams()
-        # dogleg_params.setInitialDelta(5.0)
+        # dogleg_params.setInitialDelta(0.5)
         # self.isam_params.setOptimizationParams(dogleg_params)
-        # self.isam_params.setRelinearizeThreshold(0.1)
-        # self.isam_params.relinearizeSkip = 3
         self.isam_params.setRelinearizeThreshold(0.03)
-        self.isam_params.relinearizeSkip = 1
+        self.isam_params.relinearizeSkip = 2
+        self.isam_params.cacheLinearizedFactors = True
         # self.isam_params.evaluateNonlinearError = True
         self.isam = gtsam.ISAM2(self.isam_params) if use_isam else None
         self.graph = gtsam.NonlinearFactorGraph()
         self.initial = gtsam.Values()
         self.state_index = 0
+
+        # Batch-mode (LM) accumulated graph and values
+        # In ISAM2 mode these are unused — ISAM2 keeps its own internal copy.
+        # In batch mode, graph/initial are pending additions that get merged into
+        # these accumulators before each LM solve.
+        self._batch_graph = gtsam.NonlinearFactorGraph() if not use_isam else None
+        self._batch_values = gtsam.Values() if not use_isam else None
 
         # --- Landmark management ---
         self.landmark_initialized = set()  # L(id) already in ISAM2 Values
@@ -72,23 +84,24 @@ class GraphOptimizer:
         # --- Noise models ---
         # Prior: tight rotation (0.03 rad ≈ 1.7°), moderate translation (0.2m)
         self.prior_pose_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([0.03, 0.03, 0.03, 0.1, 0.1, 0.1])
+            np.array([0.02, 0.02, 0.02, 0.1, 0.1, 0.1])
         )
-        self.prior_vel_noise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
-        # Bias prior: trust static calibration to ~0.01 m/s² accel, ~0.003 rad/s gyro.
-        # Must be loose enough for online refinement but tight enough to anchor near truth.
+        self.prior_vel_noise = gtsam.noiseModel.Isotropic.Sigma(3, 0.02)
+        # Bias prior: anchors near calibrated values but loose enough for online refinement.
+        # Zero-motion constraints during static periods provide the geometric anchoring,
+        # so the bias prior can be relaxed to allow faster convergence.
         self.prior_bias_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([0.01, 0.01, 0.01, 0.003, 0.003, 0.003])
+            np.array([0.03, 0.03, 0.03, 0.01, 0.01, 0.01])
         )
         # Landmark regularization prior (sigma in meters).
         # Tight enough to prevent ISAM2 from pushing landmarks to degenerate positions
         # during relinearization, but loose enough not to bias converged estimates.
         # Tunable at runtime via self.landmark_reg_sigma — the noise model is rebuilt
         # on each landmark promotion to reflect the current setting.
-        self.landmark_reg_sigma = 1.5  # meters — can be changed by RL agent
+        self.landmark_reg_sigma = 1  # meters (≈3× max depth filter uncertainty)
 
         # Robust pixel noise (Huber) for projection factors
-        pixel_sigma = 1  # pixels
+        pixel_sigma = 0.5  # pixels
         pixel_noise_base = gtsam.noiseModel.Isotropic.Sigma(2, pixel_sigma)
         self.pixel_noise = gtsam.noiseModel.Robust.Create(
             gtsam.noiseModel.mEstimator.Huber.Create(1.345), pixel_noise_base
@@ -99,10 +112,10 @@ class GraphOptimizer:
         # IMU+visual chain, so it carries little weight at the standard 1.5px sigma.
         # Using a smaller sigma (more information per factor) lets a handful of loop
         # re-observations actually pull the trajectory back toward the closed loop.
-        loop_pixel_sigma = 1  # pixels
+        loop_pixel_sigma = 0.2  # pixels
         loop_pixel_noise_base = gtsam.noiseModel.Isotropic.Sigma(2, loop_pixel_sigma)
         self.loop_pixel_noise = gtsam.noiseModel.Robust.Create(
-            gtsam.noiseModel.mEstimator.Huber.Create(1.345), loop_pixel_noise_base
+            gtsam.noiseModel.mEstimator.Huber.Create(1.3), loop_pixel_noise_base
         )
 
         # Spatial distribution: grid bucketing (cell_size in pixels)
@@ -122,6 +135,19 @@ class GraphOptimizer:
         # promotion attempts since the last drain. Used to correlate the geometric
         # triangulation baseline with graph conditioning (covariance / condition number).
         self.parallax_log = []
+
+        # --- Depth filter parameters (Vogiatzis Gaussian-Uniform mixture) ---
+        # Only landmarks whose depth converges below this relative uncertainty get promoted.
+        self.depth_filter_enabled = True
+        self.depth_tau = 0.02        # Inverse-depth measurement noise std (m^-1)
+        self.depth_convergence_rel = 0.1  # Max relative sigma for convergence
+        self.depth_max_sigma_m = 0.25     # Max absolute depth sigma (meters)
+        self.depth_min_inlier = 0.5   # Min inlier probability for convergence
+        self.depth_outlier_thresh = 0.3  # Below this → landmark is outlier, remove
+        self.buffer_max_age_kf = 0      # Prune buffer entries older than this many keyframes
+        self._depth_stats = {"attempted": 0, "promoted": 0, "outlier": 0, "pending": 0}
+        self.promoted_depth_log = []  # [(landmark_id, pt3_world, depth_mu, depth_sigma2, df_a, df_n)]
+        self._static_promotion_done = False  # One-time cold-start bypass
 
     def _make_projection_factor(
         self, measurement, state_idx: int, landmark_id: int, noise=None
@@ -211,6 +237,39 @@ class GraphOptimizer:
             )
 
     # ==================== IMU Factors ====================
+
+    def add_zero_velocity_prior(self, state_idx: int, sigma: float = 0.01):
+        """Add a tight zero-velocity prior for stationary periods.
+
+        Args:
+            state_idx: State index to constrain.
+            sigma: Velocity sigma in m/s (default 0.01 = 1cm/s).
+        """
+        if gtsam is None:
+            return
+        noise = gtsam.noiseModel.Isotropic.Sigma(3, sigma)
+        self.graph.add(
+            gtsam.PriorFactorVector(V(state_idx), np.zeros(3), noise)
+        )
+
+    def add_zero_motion_constraint(self, prev_idx: int, curr_idx: int,
+                                   rot_sigma: float = 0.001, trans_sigma: float = 0.005):
+        """Add a tight identity BetweenFactor<Pose3> for stationary periods.
+
+        Constrains X(curr_idx) to be (nearly) identical to X(prev_idx).
+
+        Args:
+            rot_sigma: Rotation noise sigma in rad (default 0.001 ≈ 0.06°).
+            trans_sigma: Translation noise sigma in m (default 0.005 = 5mm).
+        """
+        if gtsam is None:
+            return
+        noise = gtsam.noiseModel.Diagonal.Sigmas(
+            np.array([rot_sigma] * 3 + [trans_sigma] * 3)
+        )
+        self.graph.add(
+            gtsam.BetweenFactorPose3(X(prev_idx), X(curr_idx), gtsam.Pose3(), noise)
+        )
 
     def add_state_variable(self, idx, nav_state, bias):
         """Add a new state (pose, velocity, bias) to the initial values."""
@@ -329,7 +388,104 @@ class GraphOptimizer:
             "point_cam": np.array(landmark_3d, dtype=float),
             "first_state": state_idx,
             "observations": [(state_idx, np.array(uv, dtype=float))],
+            # Depth filter state (Vogiatzis Gaussian-Uniform mixture in inverse depth)
+            "df_mu": 1.0 / max(landmark_3d[2], 0.1),      # inverse depth mean
+            "df_sigma2": (0.2 / max(landmark_3d[2], 0.1)) ** 2,  # initial ~20% rel uncertainty
+            "df_a": 0.5,   # inlier probability (50/50 prior)
+            "df_n": 1,     # measurement count
         }
+
+    def force_promote_top_n(self, n: int = 100) -> int:
+        """One-time cold-start promotion: bypass depth filter and promote the top N
+        buffered landmarks ranked by quality (inlier probability * observation count).
+
+        Only fires once (sets _static_promotion_done). Used when the system exits
+        the static period so the graph has visual constraints before IMU drift accumulates.
+
+        Returns number of landmarks actually promoted.
+        """
+        if self._static_promotion_done:
+            return 0
+        self._static_promotion_done = True
+
+        if not self.landmark_buffer:
+            return 0
+
+        # Rank candidates: must have >= 2 distinct poses and valid depth
+        candidates = []
+        for lm_id, buf in self.landmark_buffer.items():
+            distinct_poses = len(set(s for s, _ in buf["observations"]))
+            if distinct_poses < 2:
+                continue
+            depth = buf["point_cam"][2]
+            if depth < 0.2 or depth > 15.0:
+                continue
+            # Score: prioritize high inlier probability and many observations
+            score = buf["df_a"] * buf["df_n"]
+            candidates.append((score, lm_id))
+
+        # Sort descending by score, take top N
+        candidates.sort(reverse=True)
+        promoted = 0
+        for _, lm_id in candidates[:n]:
+            buf = self.landmark_buffer[lm_id]
+            pt3_world = self._landmark_to_world(buf["point_cam"], buf["first_state"])
+
+            # Validate: landmark must be in front of all observing cameras
+            pt_gtsam = gtsam.Point3(*pt3_world)
+            valid = True
+            for s_idx, _uv in buf["observations"]:
+                estimate = self.get_current_estimate()
+                if estimate is not None and estimate.exists(X(s_idx)):
+                    world_T_body = estimate.atPose3(X(s_idx))
+                elif self.initial.exists(X(s_idx)):
+                    world_T_body = self.initial.atPose3(X(s_idx))
+                else:
+                    continue
+                if self.body_P_sensor is not None:
+                    world_T_cam = world_T_body.compose(self.body_P_sensor)
+                else:
+                    world_T_cam = world_T_body
+                pt_cam = world_T_cam.transformTo(pt_gtsam)
+                if pt_cam[2] < 0.2:
+                    valid = False
+                    break
+            if not valid:
+                continue
+
+            # Promote (bypass depth filter and parallax checks)
+            self.landmark_buffer.pop(lm_id)
+            self._depth_stats["promoted"] += 1
+            self.promoted_depth_log.append((
+                lm_id, pt3_world.copy(),
+                buf["df_mu"], buf["df_sigma2"], buf["df_a"], buf["df_n"],
+            ))
+
+            self.initial.insert(L(lm_id), gtsam.Point3(*pt3_world))
+            self.landmark_initialized.add(lm_id)
+            self.landmark_obs_count[lm_id] = 0
+
+            reg_noise = gtsam.noiseModel.Isotropic.Sigma(3, self.landmark_reg_sigma)
+            self.graph.add(
+                gtsam.PriorFactorPoint3(L(lm_id), gtsam.Point3(*pt3_world), reg_noise)
+            )
+
+            for s_idx, uv in buf["observations"]:
+                measurement = gtsam.Point2(float(uv[0]), float(uv[1]))
+                self.graph.add(
+                    self._make_projection_factor(measurement, s_idx, lm_id)
+                )
+                self.landmark_obs_count[lm_id] += 1
+
+            last_s_idx = buf["observations"][-1][0]
+            cam_pos = self._camera_position(last_s_idx)
+            if cam_pos is not None:
+                self.landmark_last_factor_cam[lm_id] = cam_pos
+            promoted += 1
+
+        if promoted > 0:
+            print(f"  [COLD-START] Force-promoted {promoted}/{len(candidates)} landmarks from buffer")
+        return promoted
 
     def _promote_landmark(self, landmark_id: int):
         """Move a landmark from the buffer into the factor graph (ISAM2).
@@ -356,12 +512,10 @@ class GraphOptimizer:
 
         # Validate: minimum parallax angle between observing poses
         max_parallax = self._max_parallax_deg(pt3_world, buf["observations"])
-        if max_parallax < self.parallax_threshold:
-            print(f"  Rejecting landmark {landmark_id} due to low parallax ({max_parallax:.1f}°)")
-            return
 
-        # Validate: landmark must be in front of ALL observing cameras
+        # Validate: landmark must be in front of ALL observing cameras + collect depths
         pt_gtsam = gtsam.Point3(*pt3_world)
+        observed_depths = []
         for s_idx, _uv in buf["observations"]:
             estimate = self.get_current_estimate()
             if estimate is not None and estimate.exists(X(s_idx)):
@@ -378,16 +532,48 @@ class GraphOptimizer:
             if pt_cam[2] < 0.2:  # Behind camera or too close
                 # Keep in buffer — pose estimates may improve later
                 return
+            observed_depths.append(float(pt_cam[2]))
+
+        # --- Depth filter: update regardless of parallax, check convergence ---
+        if self.depth_filter_enabled and len(observed_depths) >= 2:
+            self._depth_stats["attempted"] += 1
+            self._update_depth_filter(buf, observed_depths)
+            if buf["df_a"] < self.depth_outlier_thresh and buf["df_n"] >= 3:
+                # Landmark is likely an outlier — remove permanently
+                self._depth_stats["outlier"] += 1
+                self.landmark_buffer.pop(landmark_id)
+                return
+            rel_sigma = np.sqrt(buf["df_sigma2"]) / max(abs(buf["df_mu"]), 1e-10)
+            # Absolute depth sigma: σ_d = σ_ρ * d²
+            depth_est = 1.0 / max(abs(buf["df_mu"]), 1e-10)
+            abs_sigma_m = np.sqrt(buf["df_sigma2"]) * depth_est * depth_est
+            if (rel_sigma > self.depth_convergence_rel
+                    or abs_sigma_m > self.depth_max_sigma_m
+                    or buf["df_a"] < self.depth_min_inlier):
+                # Not converged yet — keep in buffer for more observations
+                self._depth_stats["pending"] += 1
+                return
+
+        # Parallax gate (checked after depth filter so filter can accumulate)
+        if max_parallax < self.parallax_threshold:
+            return
 
         # All checks passed — pop from buffer and commit to graph
         self.landmark_buffer.pop(landmark_id)
+        if self.depth_filter_enabled:
+            self._depth_stats["promoted"] += 1
+            # Log depth filter state at promotion for visualization
+            self.promoted_depth_log.append((
+                landmark_id, pt3_world.copy(),
+                buf["df_mu"], buf["df_sigma2"], buf["df_a"], buf["df_n"],
+            ))
 
         self.initial.insert(L(landmark_id), gtsam.Point3(*pt3_world))
         self.landmark_initialized.add(landmark_id)
         self.landmark_obs_count[landmark_id] = 0
 
         # Regularization prior to prevent indeterminate linear system
-        # Uses current landmark_reg_sigma (tunable by RL agent at runtime)
+        # Uses current landmark_reg_sigma
         reg_noise = gtsam.noiseModel.Isotropic.Sigma(3, self.landmark_reg_sigma)
         self.graph.add(
             gtsam.PriorFactorPoint3(
@@ -464,6 +650,52 @@ class GraphOptimizer:
                 X(matched_idx), X(current_idx), relative_pose, noise_model
             )
         )
+
+    def _update_depth_filter(self, buf: dict, observed_depths: List[float]):
+        """Update Vogiatzis Gaussian-Uniform mixture depth filter.
+
+        Models inverse depth as: p(d) = a * N(mu, sigma2) + (1-a) * U(1/d_max, 1/d_min)
+        Each depth measurement updates the mixture via Bayesian inference.
+        Inlier measurements tighten the Gaussian; outliers are absorbed by the uniform.
+
+        Args:
+            buf: Landmark buffer dict containing filter state (df_mu, df_sigma2, df_a, df_n).
+            observed_depths: Depth measurements from different cameras (meters).
+        """
+        d_min, d_max = 0.1, 20.0
+        uniform_range = 1.0 / d_min - 1.0 / d_max  # range in inverse depth
+        p_uniform = 1.0 / uniform_range
+        tau2 = self.depth_tau ** 2
+
+        for depth in observed_depths:
+            if depth <= d_min or depth > d_max:
+                continue
+
+            z = 1.0 / depth  # measurement in inverse depth
+            mu = buf["df_mu"]
+            sigma2 = buf["df_sigma2"]
+            a = buf["df_a"]
+
+            # Gaussian likelihood of this measurement
+            S = sigma2 + tau2
+            residual = z - mu
+            p_gauss = (1.0 / np.sqrt(2.0 * np.pi * S)) * np.exp(-0.5 * residual ** 2 / S)
+
+            # Posterior inlier probability
+            denom = a * p_gauss + (1.0 - a) * p_uniform
+            if denom < 1e-30:
+                continue
+            a_new = (a * p_gauss) / denom
+
+            # Kalman update of Gaussian component
+            K = sigma2 / S
+            mu_new = mu + K * residual
+            sigma2_new = (1.0 - K) * sigma2
+
+            buf["df_mu"] = mu_new
+            buf["df_sigma2"] = sigma2_new
+            buf["df_a"] = a_new
+            buf["df_n"] += 1
 
     def _max_parallax_deg(self, pt3_world: np.ndarray, observations: list) -> float:
         """ Important note because this function is critical:
@@ -624,7 +856,7 @@ class GraphOptimizer:
                 # One extra iteration helps convergence
 
                 if (
-                    update_result.getVariablesRelinearized() > 8
+                    update_result.getVariablesRelinearized() > 50
                     # or abs(error_diff) > 1.0
                 ):
                     self.isam.update()
@@ -639,8 +871,33 @@ class GraphOptimizer:
             self._cached_estimate = self.isam.calculateEstimate()
             return self._cached_estimate
         else:
-            optimizer = gtsam.LevenbergMarquardtOptimizer(self.graph, self.initial)
-            result = optimizer.optimize()
+            # Batch LM mode: merge pending factors/values into accumulators
+            for i in range(self.graph.size()):
+                self._batch_graph.add(self.graph.at(i))
+            self.graph.resize(0)
+
+            # Merge new initial values (skip keys already present — use latest estimate)
+            keys = self.initial.keys()
+            for key in keys:
+                if not self._batch_values.exists(key):
+                    self._batch_values.insert(key, self.initial.atGeneric(key))
+            self.initial.clear()
+
+            # Use previous estimate as linearization point for known variables
+            if self._cached_estimate is not None:
+                for key in self._cached_estimate.keys():
+                    if self._batch_values.exists(key):
+                        self._batch_values.update(key, self._cached_estimate.atGeneric(key))
+
+            params = gtsam.LevenbergMarquardtParams()
+            params.setMaxIterations(20)
+            lm = gtsam.LevenbergMarquardtOptimizer(
+                self._batch_graph, self._batch_values, params
+            )
+            result = lm.optimize()
+            self._cached_estimate = result
+            # Update batch values to latest estimate for next iteration
+            self._batch_values = result
             return result
 
     # ==================== Helpers ====================
@@ -684,12 +941,20 @@ class GraphOptimizer:
 
     def diagnostics(self):
         """Return optimization quality metrics."""
-        if gtsam is None or self.isam is None:
+        if gtsam is None:
             return {}
-        result = self.isam.calculateEstimate()
-        total_error = self.isam.getFactorsUnsafe().error(result)
+        result = self.get_current_estimate()
+        if result is None:
+            return {}
+        if self.isam is not None:
+            factors = self.isam.getFactorsUnsafe()
+        elif self._batch_graph is not None:
+            factors = self._batch_graph
+        else:
+            return {}
+        total_error = factors.error(result)
         n_vars = result.size()
-        n_factors = self.isam.getFactorsUnsafe().size()
+        n_factors = factors.size()
         avg_error = total_error / max(n_factors, 1)
         metrics = {
             "total_error": total_error,
@@ -701,18 +966,9 @@ class GraphOptimizer:
         return metrics
 
     def drain_parallax_stats(self):
-        """Return (and clear) parallax-angle stats accumulated since the last call.
-
-        Aggregates the per-landmark max-parallax angles (deg) computed during
-        landmark promotion attempts in the current optimize cycle. Returns zeros
-        when no promotions were attempted this cycle.
-        """
+        """Return (and clear) parallax-angle stats accumulated since the last call."""
         if not self.parallax_log:
-            return {
-                "parallax_max_deg": 0.0,
-                "parallax_median_deg": 0.0,
-                "parallax_count": 0,
-            }
+            return {"parallax_max_deg": 0.0, "parallax_median_deg": 0.0, "parallax_count": 0}
         arr = np.asarray(self.parallax_log, dtype=float)
         stats = {
             "parallax_max_deg": float(arr.max()),
@@ -721,6 +977,30 @@ class GraphOptimizer:
         }
         self.parallax_log = []
         return stats
+
+    def drain_depth_filter_stats(self) -> Dict:
+        """Return (and clear) depth filter stats since last call."""
+        stats = dict(self._depth_stats)
+        self._depth_stats = {"attempted": 0, "promoted": 0, "outlier": 0, "pending": 0}
+        return stats
+
+    def prune_stale_buffer(self, current_kf_idx: int) -> int:
+        """Remove buffer entries whose first observation is too old.
+
+        Landmarks that haven't converged within buffer_max_age_kf keyframes
+        will never converge — the camera has moved on and won't re-see them.
+        Pruning them frees memory and reduces per-frame overhead.
+
+        Returns number of pruned entries.
+        """
+        if self.buffer_max_age_kf <= 0:
+            return 0
+        cutoff = current_kf_idx - self.buffer_max_age_kf
+        stale = [lm_id for lm_id, buf in self.landmark_buffer.items()
+                 if buf["first_state"] < cutoff]
+        for lm_id in stale:
+            del self.landmark_buffer[lm_id]
+        return len(stale)
 
     # ==================== Landmark Uncertainty Filtering ====================
 
@@ -783,8 +1063,12 @@ class GraphOptimizer:
             return None
         return cov6[3:6, 3:6]
 
-    def detect_degeneracy(self, state_idx: int) -> Dict:
+    def detect_degeneracy(self, state_idx: int, pos_cov: Optional[np.ndarray] = None) -> Dict:
         """Analyze pose covariance to detect degenerate motion conditions.
+
+        Args:
+            state_idx: Pose state index to analyze.
+            pos_cov: Pre-computed 3x3 position covariance. If None, computed internally.
 
         Returns:
             'position_eigenvalues': sorted eigenvalues of position cov (ascending)
@@ -803,7 +1087,8 @@ class GraphOptimizer:
             "motion_type": "normal",
         }
 
-        pos_cov = self.get_position_covariance(state_idx)
+        if pos_cov is None:
+            pos_cov = self.get_position_covariance(state_idx)
         if pos_cov is None:
             return result
 
@@ -838,5 +1123,223 @@ class GraphOptimizer:
             result["motion_type"] = "pure_rotation (no translational motion observed)"
 
         return result
+
+    # ==================== Factor Graph Visualization ====================
+
+    def visualize_factor_graph_3d(self, output_path: str = "factor_graph_3d.html"):
+        """Render the GTSAM factor graph as an interactive 3D Plotly visualization.
+
+        Shows:
+          - Pose nodes (X) as red cubes along the trajectory, connected by a red line.
+          - Landmark nodes (L) as small green dots at their optimized 3D positions.
+          - Projection factor edges as thin blue lines (pose → landmark).
+          - IMU factor edges as thick orange lines (pose → pose).
+          - Prior factors as yellow markers on the constrained node.
+
+        This replicates the factor graph diagrams seen in VIO papers (e.g. Fig. 2
+        in Forster et al. 2017, Kimera paper Fig. 3) but in 3D with real coordinates.
+
+        Args:
+            output_path: Path to save the interactive HTML file.
+        """
+        try:
+            import plotly.graph_objects as go
+        except ImportError:
+            print("[visualize_factor_graph_3d] plotly not installed, skipping.")
+            return
+
+        estimate = self.get_current_estimate()
+        if estimate is None:
+            print("[visualize_factor_graph_3d] No estimate available.")
+            return
+
+        # --- Collect node positions ---
+        pose_positions = {}  # {state_idx: np.array(3,)}
+        for idx in range(self.state_index + 1):
+            if estimate.exists(X(idx)):
+                p = estimate.atPose3(X(idx)).translation()
+                pose_positions[idx] = np.array([p[0], p[1], p[2]])
+
+        # Build depth uncertainty lookup from promoted_depth_log
+        # depth_sigma_m = sqrt(df_sigma2) * d^2, where d = 1/df_mu
+        lm_depth_sigma = {}  # {landmark_id: depth_sigma_meters}
+        for entry in self.promoted_depth_log:
+            lm_id, _, df_mu, df_sigma2, df_a, df_n = entry
+            d = 1.0 / max(abs(df_mu), 1e-10)
+            sigma_m = np.sqrt(df_sigma2) * d * d
+            lm_depth_sigma[lm_id] = sigma_m
+
+        landmark_positions = {}  # {lm_id: np.array(3,)}
+        for lm_id in self.landmark_initialized:
+            if estimate.exists(L(lm_id)):
+                p = estimate.atPoint3(L(lm_id))
+                landmark_positions[lm_id] = np.array([p[0], p[1], p[2]])
+
+        # --- Get the factor graph (ISAM2 stores it internally) ---
+        if self.isam is not None:
+            factors = self.isam.getFactorsUnsafe()
+        elif self._batch_graph is not None:
+            factors = self._batch_graph
+        else:
+            print("[visualize_factor_graph_3d] No factor graph available.")
+            return
+
+        # --- Classify edges by factor type ---
+        projection_edges = []  # [(pose_pos, lm_pos), ...]
+        imu_edges = []         # [(pose_pos_i, pose_pos_j), ...]
+        between_edges = []     # [(pose_pos_i, pose_pos_j), ...]
+
+        for i in range(factors.size()):
+            factor = factors.at(i)
+            factor_keys = factor.keys()
+            # keys() may return a list or a KeyVector depending on GTSAM binding
+            if hasattr(factor_keys, 'size'):
+                keys = [factor_keys.at(j) for j in range(factor_keys.size())]
+            else:
+                keys = list(factor_keys)
+
+            if len(keys) == 2:
+                k0, k1 = keys
+                s0 = gtsam.Symbol(k0)
+                s1 = gtsam.Symbol(k1)
+                c0, c1 = chr(s0.chr()), chr(s1.chr())
+                i0, i1 = s0.index(), s1.index()
+
+                # Projection factor: X(i) ↔ L(j)
+                if (c0 == 'x' and c1 == 'l'):
+                    if i0 in pose_positions and i1 in landmark_positions:
+                        projection_edges.append((pose_positions[i0], landmark_positions[i1]))
+                elif (c0 == 'l' and c1 == 'x'):
+                    if i1 in pose_positions and i0 in landmark_positions:
+                        projection_edges.append((pose_positions[i1], landmark_positions[i0]))
+
+                # IMU / Between factor: X(i) ↔ X(j) or V/B pairs
+                elif c0 == 'x' and c1 == 'x':
+                    if i0 in pose_positions and i1 in pose_positions:
+                        between_edges.append((pose_positions[i0], pose_positions[i1]))
+
+            elif len(keys) == 5:
+                # ImuFactor has 5 keys: X(i), V(i), X(j), V(j), B(i)
+                s0 = gtsam.Symbol(keys[0])
+                s2 = gtsam.Symbol(keys[2])
+                if chr(s0.chr()) == 'x' and chr(s2.chr()) == 'x':
+                    i0, i2 = s0.index(), s2.index()
+                    if i0 in pose_positions and i2 in pose_positions:
+                        imu_edges.append((pose_positions[i0], pose_positions[i2]))
+
+        # --- Build Plotly traces ---
+        traces = []
+
+        # Trajectory line (poses connected in order)
+        sorted_poses = sorted(pose_positions.items())
+        if sorted_poses:
+            traj = np.array([p for _, p in sorted_poses])
+            traces.append(go.Scatter3d(
+                x=traj[:, 0], y=traj[:, 1], z=traj[:, 2],
+                mode='lines+markers',
+                marker=dict(size=4, color='red', symbol='square'),
+                line=dict(color='red', width=3),
+                name=f'Poses ({len(sorted_poses)})',
+                text=[f'X({idx})' for idx, _ in sorted_poses],
+                hoverinfo='text',
+            ))
+
+        # Landmark points — colored by depth filter uncertainty (heatmap)
+        if landmark_positions:
+            lm_ids_sorted = sorted(landmark_positions.keys())
+            lm_pts = np.array([landmark_positions[lid] for lid in lm_ids_sorted])
+            # Get depth sigma for each landmark; default to 0 if not in log
+            lm_sigmas = np.array([lm_depth_sigma.get(lid, 0.0) for lid in lm_ids_sorted])
+            # Clip for colorscale readability (cap at 0.5m)
+            lm_sigmas_clipped = np.clip(lm_sigmas, 0, 0.5)
+            traces.append(go.Scatter3d(
+                x=lm_pts[:, 0], y=lm_pts[:, 1], z=lm_pts[:, 2],
+                mode='markers',
+                marker=dict(
+                    size=2,
+                    color=lm_sigmas_clipped,
+                    colorscale='RdYlGn_r',  # green=low uncertainty, red=high
+                    cmin=0, cmax=0.3,
+                    colorbar=dict(
+                        title='Depth σ (m)',
+                        thickness=15,
+                        len=0.5,
+                        x=1.02,
+                    ),
+                    opacity=0.7,
+                ),
+                name=f'Landmarks ({len(lm_pts)})',
+                text=[f'L({lid})<br>σ={lm_depth_sigma.get(lid, 0):.4f}m' for lid in lm_ids_sorted],
+                hoverinfo='text',
+            ))
+
+        # Projection edges (pose → landmark)
+        # Subsample if too many for performance
+        max_proj_edges = 2000
+        proj_sample = projection_edges
+        if len(projection_edges) > max_proj_edges:
+            rng = np.random.default_rng(42)
+            indices = rng.choice(len(projection_edges), max_proj_edges, replace=False)
+            proj_sample = [projection_edges[i] for i in indices]
+
+        if proj_sample:
+            px, py, pz = [], [], []
+            for p0, p1 in proj_sample:
+                px.extend([p0[0], p1[0], None])
+                py.extend([p0[1], p1[1], None])
+                pz.extend([p0[2], p1[2], None])
+            traces.append(go.Scatter3d(
+                x=px, y=py, z=pz,
+                mode='lines',
+                line=dict(color='rgba(155, 155, 175,0.8)', width=1),
+                name=f'Projection factors ({len(projection_edges)})',
+                hoverinfo='skip',
+            ))
+
+        # IMU edges
+        if imu_edges:
+            ix, iy, iz = [], [], []
+            for p0, p1 in imu_edges:
+                ix.extend([p0[0], p1[0], None])
+                iy.extend([p0[1], p1[1], None])
+                iz.extend([p0[2], p1[2], None])
+            traces.append(go.Scatter3d(
+                x=ix, y=iy, z=iz,
+                mode='lines',
+                line=dict(color='orange', width=4),
+                name=f'IMU factors ({len(imu_edges)})',
+                hoverinfo='skip',
+            ))
+
+        # Between edges (loop closure, zero-motion)
+        if between_edges:
+            bx, by, bz = [], [], []
+            for p0, p1 in between_edges:
+                bx.extend([p0[0], p1[0], None])
+                by.extend([p0[1], p1[1], None])
+                bz.extend([p0[2], p1[2], None])
+            traces.append(go.Scatter3d(
+                x=bx, y=by, z=bz,
+                mode='lines',
+                line=dict(color='purple', width=2),
+                name=f'Between factors ({len(between_edges)})',
+                hoverinfo='skip',
+            ))
+
+        fig = go.Figure(data=traces)
+        fig.update_layout(
+            title=f'Factor Graph — {len(pose_positions)} poses, '
+                  f'{len(landmark_positions)} landmarks, '
+                  f'{factors.size()} factors',
+            scene=dict(
+                xaxis_title='X (m)', yaxis_title='Y (m)', zaxis_title='Z (m)',
+                aspectmode='data',
+            ),
+            legend=dict(yanchor='top', y=0.99, xanchor='left', x=0.01),
+            margin=dict(l=0, r=0, b=0, t=40),
+        )
+        fig.write_html(output_path)
+        print(f"  Factor graph visualization saved to {output_path}")
+        return fig
 
 

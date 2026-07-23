@@ -35,7 +35,7 @@ import numpy as np
 import yaml
 import pandas as pd
 from scipy.spatial.transform import Rotation as R
-from threading import Thread
+from threading import Thread, Lock
 from queue import Queue, Empty
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple, Any
@@ -43,13 +43,22 @@ import time
 
 import sys
 
-sys.path.append(r"f:\Code\SLAM")
+# sys.path.append(r"f:\Code\SLAM")
 from data_manager import DataManager
 from v_frontend import vFeature
 from imu_pipeline import IMUPipeline, IMUCalibration, IMUSample
 from vio_optimizer import GraphOptimizer, X, V, B, L
 from vio_visualizer import VIOVisualizer
 import gtsam
+
+# RL Agent imports
+from stable_baselines3 import PPO
+from rl_vio_env import (
+    PARALLAX_OPTIONS, MIN_FEATURES_OPTIONS,
+    MIN_OBS_PARALLAX_OPTIONS,
+    MAP_STATS_DIM, MAX_KEYPOINTS_FOR_OBS, KEYPOINT_FEAT_DIM, OBS_DIM,
+    _umeyama_align,
+)
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -64,6 +73,7 @@ class FrontendResult:
     observations: List
     new_landmarks_3d: Dict
     loop_candidates: List
+    lc_matched_frames: List  # [(frame_idx, vote_count), ...] from query_similar_frames
     median_displacement: float = 0.0
 
 
@@ -89,6 +99,91 @@ class VisFrame:
     pose_covariance: Optional[np.ndarray]
     ate_rmse: Optional[float]
 
+
+
+# ---------------------------------------------------------------------------
+# RL Agent observation builder (mirrors rl_vio_env._build_observation)
+# ---------------------------------------------------------------------------
+def build_rl_observation(
+    n_tracked: int,
+    n_landmarks: int,
+    frame_count: int,
+    est_positions: list,
+    gt_positions: list,
+    optimizer: GraphOptimizer,
+    kf_idx: int,
+    imu_pipeline_obj,
+    feature_pipeline,
+    reward_window: int = 5,
+) -> np.ndarray:
+    """Build the same observation vector the RL agent expects."""
+    obs = np.zeros(OBS_DIM, dtype=np.float32)
+    idx = 0
+
+    obs[idx] = n_tracked / 1000.0; idx += 1
+    obs[idx] = n_landmarks / 5000.0; idx += 1
+    obs[idx] = frame_count / 500.0; idx += 1
+
+    # Sliding window ATE
+    if len(est_positions) >= reward_window:
+        est_w = np.array(est_positions[-reward_window:])
+        gt_w = np.array(gt_positions[-reward_window:])
+        _, errs = _umeyama_align(est_w, gt_w)
+        obs[idx] = errs[-1] if len(errs) > 0 else 0.0; idx += 1
+        obs[idx] = errs.mean() if len(errs) > 0 else 0.0; idx += 1
+        obs[idx] = errs.max() if len(errs) > 0 else 0.0; idx += 1
+    else:
+        idx += 3
+
+    # Optimizer diagnostics
+    metrics = optimizer.diagnostics()
+    if metrics:
+        obs[idx] = np.clip(metrics.get("avg_error_per_factor", 0) / 10.0, -5, 5); idx += 1
+        obs[idx] = metrics.get("n_landmarks", 0) / 1000.0; idx += 1
+        obs[idx] = metrics.get("n_factors", 0) / 5000.0; idx += 1
+    else:
+        idx += 3
+
+    # Position covariance eigenvalues
+    pos_cov = optimizer.get_position_covariance(kf_idx)
+    if pos_cov is not None:
+        eigs = np.sort(np.linalg.eigvalsh(pos_cov))
+        obs[idx] = np.clip(np.sqrt(eigs[0]), 0, 5); idx += 1
+        obs[idx] = np.clip(np.sqrt(eigs[1]), 0, 5); idx += 1
+        obs[idx] = np.clip(np.sqrt(eigs[2]), 0, 5); idx += 1
+    else:
+        idx += 3
+
+    # Degeneracy flag
+    deg = optimizer.detect_degeneracy(kf_idx)
+    obs[idx] = 1.0 if deg.get("degenerate", False) else 0.0; idx += 1
+
+    # IMU preintegration deltas
+    try:
+        dp = imu_pipeline_obj.preint.preint.deltaPij()
+        dv = imu_pipeline_obj.preint.preint.deltaVij()
+        obs[idx] = np.linalg.norm(dp); idx += 1
+        obs[idx] = np.linalg.norm(dv); idx += 1
+    except Exception:
+        idx += 2
+
+    # Keypoints
+    kp_start = MAP_STATS_DIM
+    if feature_pipeline.prev_keypoints is not None:
+        kpts = feature_pipeline.prev_keypoints
+        n = min(len(kpts), MAX_KEYPOINTS_FOR_OBS)
+        if len(kpts) > MAX_KEYPOINTS_FOR_OBS:
+            indices = np.linspace(0, len(kpts) - 1, MAX_KEYPOINTS_FOR_OBS, dtype=int)
+            kpts = kpts[indices]
+        img_w, img_h = 752, 480
+        for j in range(n):
+            base = kp_start + j * KEYPOINT_FEAT_DIM
+            obs[base + 0] = (kpts[j, 0] / img_w) * 2 - 1
+            obs[base + 1] = (kpts[j, 1] / img_h) * 2 - 1
+            obs[base + 2] = 0.0
+            obs[base + 3] = 0.0
+
+    return obs
 
 
 def compute_ate(est_positions, gt_positions):
@@ -213,12 +308,13 @@ def frontend_worker(
     data_manager: DataManager,
     result_queue: Queue,
     r_prev_curr_holder: List,  # Mutable container: [R_prev_curr or None]
+    r_prev_curr_lock: Lock,    # Protects reads/writes to r_prev_curr_holder
     frame_step: int,
     start_frame: int,
 ):
     """Frontend thread: extracts features from stereo frames and pushes results to queue.
 
-    Reads r_prev_curr_holder[0] for IMU-guided optical flow (one-frame latency).
+    Reads r_prev_curr_holder[0] under lock for IMU-guided optical flow (one-frame latency).
     """
     first_run = True
 
@@ -233,7 +329,8 @@ def frontend_worker(
             first_run = False
 
         # Read IMU-predicted rotation (one-frame latency from backend)
-        R_prev_curr = r_prev_curr_holder[0]
+        with r_prev_curr_lock:
+            R_prev_curr = r_prev_curr_holder[0]
 
         # Heavy computation: SuperPoint + LightGlue + KLT + triangulation
         t0 = time.perf_counter()
@@ -253,6 +350,7 @@ def frontend_worker(
             observations=observations,
             new_landmarks_3d=new_landmarks_3d,
             loop_candidates=loop_candidates,
+            lc_matched_frames=list(feature_pipeline.lc_matched_frames),
             median_displacement=median_displacement,
         )
 
@@ -264,8 +362,8 @@ def frontend_worker(
 
 
 def main():
-    data_dir = "f:/Code/exercise_10/data/MH_01_easy/mav0"
-    # "/home/liorsl/Self/datasets/MH_01_easy/MH_01_easy/mav0"
+    data_dir = "/home/liorsl/Self/datasets/MH_01_easy/MH_01_easy/mav0"
+    # 
     if not os.path.exists(data_dir):
         print(f"Data directory {data_dir} does not exist.")
         return
@@ -303,8 +401,8 @@ def main():
     imu_calib = IMUCalibration(
         accel_bias=accel_bias_init,
         gyro_bias=gyro_bias_init,
-        accel_noise=2.0e-3 * 2,
-        gyro_noise=(1.6968e-4) * 2,  # 5x datasheet
+        accel_noise=2.0e-3,
+        gyro_noise=1.6968e-4,
     )
     imu_pipeline = IMUPipeline(imu_calib)
     optimizer = GraphOptimizer(
@@ -347,6 +445,28 @@ def main():
     ate_est_positions = []
     ate_gt_positions = []
 
+    # --- RL Agent ---
+    rl_model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rl_vio_agent_mh01.zip")
+    rl_agent = None
+    if os.path.exists(rl_model_path):
+        rl_agent = PPO.load(rl_model_path, device="cpu")
+        print(f"  RL agent loaded from {rl_model_path}")
+    else:
+        print(f"  RL agent NOT found at {rl_model_path} — using fixed parameters.")
+
+    # RL action log
+    import csv
+    rl_action_log_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "rl_action_log.csv"
+    )
+    rl_action_log_file = open(rl_action_log_path, "w", newline="")
+    rl_action_writer = csv.writer(rl_action_log_file)
+    rl_action_writer.writerow([
+        "frame_idx", "kf_idx", "timestamp",
+        "parallax_threshold", "min_features", "min_obs_parallax",
+        "action_idx_0", "action_idx_1", "action_idx_2",
+    ])
+
     # --- Visualization ---
     visualizer = VIOVisualizer(max_trail_length=500, update_interval=0.05)
 
@@ -354,14 +474,18 @@ def main():
     # --- 2. Launch Frontend Thread ---
     # =================================================================
     frame_step = 10
-    start_frame = 40 * frame_step 
+    start_frame = 40 * frame_step + 22*frame_step
     loop_closure_start_frame = 10
     use_imu_for_flow = False
-    imu_flow_error_threshold = 2.0
+    # NOTE: Hinders performance in some cases
+    imu_flow_error_threshold = 0.2
+    use_rl_agent = False  # Set to False to disable RL parameter tuning
 
-    # Shared state: backend writes R_prev_curr here, frontend reads it
-    # Using a mutable list as a simple lock-free holder (single writer, single reader)
+    # Shared state: backend writes R_prev_curr here, frontend reads it.
+    # Protected by a lock so the frontend always sees a complete, consistent
+    # rotation matrix (or None) — never a partially-written value.
     r_prev_curr_holder = [None]
+    r_prev_curr_lock = Lock()
 
     # Queue with maxsize=2: allows frontend to be 1 frame ahead, blocks if backend is slow
     result_queue = Queue(maxsize=2)
@@ -376,6 +500,7 @@ def main():
             data_manager,
             result_queue,
             r_prev_curr_holder,
+            r_prev_curr_lock,
             frame_step,
             start_frame,
         ),
@@ -403,7 +528,6 @@ def main():
     R_body_cam = data_manager.T_imu_cam0[:3, :3]
 
     # --- Gating analysis log: per-state geometry (parallax) vs. conditioning ---
-    import csv
     gating_log_path = os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "gating_analysis_log.csv"
     )
@@ -414,6 +538,11 @@ def main():
         "median_pixel_disp", "parallax_max_deg", "parallax_median_deg", "parallax_count",
         "cov_trace", "cov_eig0", "cov_eig1", "cov_eig2", "condition_number",
         "degenerate", "motion_type", "avg_error_per_factor", "total_error", "n_factors",
+        "n_landmarks", "n_buffered", "n_new_landmarks",
+        "df_attempted", "df_promoted", "df_outlier", "df_pending",
+        "ate_rmse", "frame_error",
+        "worst_dir_x", "worst_dir_y", "worst_dir_z",
+        "backend_ms",
     ])
 
     # --- Keyframe gating + initialization state ---
@@ -425,8 +554,8 @@ def main():
     init_done = False           # becomes True once the graph covariance stabilizes
     cov_trace_window = []       # recent position-covariance traces (init stability window)
     INIT_STABLE_WINDOW = 5      # keyframes of stable covariance required to finish init
-    INIT_STABLE_REL_STD = 0.002  # relative std (std/mean) threshold for "stable"
-    KF_DISP_THRESHOLD = 20.0    # px of accumulated parallax to trigger a keyframe (tunable)
+    INIT_STABLE_REL_STD = 0.00  # relative std (std/mean) threshold for "stable"
+    KF_DISP_THRESHOLD = 5.5    # px of accumulated parallax to trigger a keyframe (tunable)
 
     # Preintegration accumulates from the initial bias until the first keyframe commits.
     imu_pipeline.preint.reset(initial_bias.accelerometer(), initial_bias.gyroscope())
@@ -524,7 +653,49 @@ def main():
             print(f"  Backend time: {backend_ms:.1f} ms")
             continue
 
-        # --- C. Commit a new keyframe state and factors ---
+        # --- C. RL Agent: select parameters for this keyframe ---
+        if use_rl_agent and rl_agent is not None and len(ate_est_positions) >= 3:
+            t_rl_start = time.perf_counter()
+            rl_obs = build_rl_observation(
+                n_tracked=len(observations),
+                n_landmarks=len(feature_pipeline.landmarks),
+                frame_count=kf_idx + 1,
+                est_positions=ate_est_positions,
+                gt_positions=ate_gt_positions,
+                optimizer=optimizer,
+                kf_idx=kf_idx,
+                imu_pipeline_obj=imu_pipeline,
+                feature_pipeline=feature_pipeline,
+            )
+            rl_action, _ = rl_agent.predict(rl_obs, deterministic=True)
+            rl_inference_ms = (time.perf_counter() - t_rl_start) * 1000
+
+            # Apply actions
+            parallax_val = PARALLAX_OPTIONS[rl_action[0]]
+            min_feat_val = MIN_FEATURES_OPTIONS[rl_action[1]]
+            min_obs_par_val = MIN_OBS_PARALLAX_OPTIONS[rl_action[2]]
+
+            optimizer.parallax_threshold = parallax_val
+            feature_pipeline.MIN_TRACKED_FEATURES = min_feat_val
+            optimizer.min_obs_parallax_deg = min_obs_par_val
+
+            # Log
+            rl_action_writer.writerow([
+                i, kf_idx + 1, current_cam_timestamp,
+                f"{parallax_val:.1f}", min_feat_val,
+                f"{min_obs_par_val:.1f}",
+                int(rl_action[0]), int(rl_action[1]),
+                int(rl_action[2]),
+            ])
+            rl_action_log_file.flush()
+
+            print(
+                f"  [RL] parallax={parallax_val:.1f}°, min_feat={min_feat_val}, "
+                f"obs_par={min_obs_par_val:.1f}° "
+                f"({rl_inference_ms:.2f} ms)"
+            )
+
+        # --- C2. Commit a new keyframe state and factors ---
         prev_kf = kf_idx
         kf_idx += 1
         current_estimate = optimizer.get_current_estimate()
@@ -537,6 +708,20 @@ def main():
         optimizer.add_state_variable(kf_idx, predicted_state, last_bias)
         optimizer.add_imu_factor(imu_pipeline.preint.preint, prev_kf, kf_idx)
 
+        # Stationary detection: if accumulated pixel displacement is negligible,
+        # add zero-velocity and zero-motion constraints to prevent drift.
+        STATIONARY_DISP_THRESHOLD = 1.0  # px — below this, assume stationary
+        if accumulated_disp < STATIONARY_DISP_THRESHOLD:
+            
+            optimizer.add_zero_velocity_prior(kf_idx, sigma=0.01)
+            optimizer.add_zero_motion_constraint(prev_kf, kf_idx)
+            print(f"  [STATIC] Zero-motion constraints added (disp={accumulated_disp:.2f}px)")
+        else:
+            INIT_STABLE_REL_STD = 0.00
+            # Cold-start: on first motion frame, force-promote top landmarks
+            # so the graph has visual constraints before IMU drift accumulates.
+            # if not optimizer._static_promotion_done and len(optimizer.landmark_initialized) == 0:
+            #     optimizer.force_promote_top_n(n=50)
         # Visual factors
         for lm_id, frame_id, uv in observations:
             lm_3d = new_landmarks_3d.get(lm_id, None)
@@ -580,6 +765,40 @@ def main():
         elif loop_candidates and kf_idx < loop_closure_start_frame:
             print(f"  Loop candidates deferred until keyframe {loop_closure_start_frame}.")
 
+        # Pose-graph loop closure via matched frames (Ill posed, should work with an outside PnP measurement)
+        # lc_matched_frames = result.lc_matched_frames
+        # if lc_matched_frames and kf_idx >= loop_closure_start_frame:
+        #     current_est_lc = optimizer.get_current_estimate()
+        #     # Use predicted_state.pose() for current kf since it's not in ISAM2 yet
+        #     current_body_pose = predicted_state.pose()
+        #     for matched_frame_idx, vote_count in lc_matched_frames:
+        #         matched_kf = matched_frame_idx
+        #         if matched_kf >= kf_idx or matched_kf < 1:
+        #             continue
+        #         if current_est_lc is None or not current_est_lc.exists(X(matched_kf)):
+        #             print(f"    [LC-skip] X({matched_kf}) not in estimate (votes={vote_count})")
+        #             continue
+        #         if vote_count < 80:
+        #             continue
+        #         if kf_idx - matched_kf < 15:
+        #             continue
+        #         matched_body_pose = current_est_lc.atPose3(X(matched_kf))
+        #         relative_pose = matched_body_pose.between(current_body_pose)
+        #         confidence = min(vote_count / 200.0, 1.0)
+        #         rot_sigma = 0.08 / (0.5 + confidence)
+        #         trans_sigma = 0.25 / (0.5 + confidence)
+        #         noise_sigmas = np.array([rot_sigma]*3 + [trans_sigma]*3)
+        #         optimizer.add_loop_closure_pose_constraint(
+        #             current_idx=kf_idx,
+        #             matched_idx=matched_kf,
+        #             relative_pose=relative_pose,
+        #             noise_sigmas=noise_sigmas,
+        #         )
+        #         print(
+        #             f"  + LC pose constraint: kf[{kf_idx}]↔kf[{matched_kf}] "
+        #             f"(votes={vote_count}, σ_r={rot_sigma:.3f}, σ_t={trans_sigma:.3f})"
+        #         )
+
         # --- D. Optimize ---
         optimizer.optimize()
         print("  Graph optimized.")
@@ -588,11 +807,23 @@ def main():
         print(
             f"  Error: {metrics['total_error']:.2f} | Avg/factor: {metrics['avg_error_per_factor']:.4f} | Vars: {metrics['n_variables']} | Factors: {metrics['n_factors']}"
         )
+        df_stats = optimizer.drain_depth_filter_stats()
+        if df_stats["attempted"] > 0:
+            print(
+                f"  [DepthFilter] attempted={df_stats['attempted']} promoted={df_stats['promoted']} "
+                f"outlier={df_stats['outlier']} pending={df_stats['pending']}"
+            )
 
         # --- Filter high-uncertainty landmarks (every 10 frames) ---
         # Slow - prefer not to use
         # if i % 10 == 0 and i > 0:
         #     optimizer.filter_uncertain_landmarks(max_trace=3.0)
+
+        # --- Prune stale buffer entries ---
+        if optimizer.buffer_max_age_kf > 0:
+            pruned = optimizer.prune_stale_buffer(kf_idx)
+            if pruned > 0:
+                print(f"  [Buffer] Pruned {pruned} stale landmarks (age > {optimizer.buffer_max_age_kf} kf)")
 
         # --- Covariance & Degeneracy ---
         pos_cov = optimizer.get_position_covariance(kf_idx)
@@ -638,30 +869,7 @@ def main():
                             f"(need < {INIT_STABLE_REL_STD})."
                         )
 
-        # --- Gating analysis logging (geometry vs. conditioning) ---
-        para_stats = optimizer.drain_parallax_stats()
-        cond_num = degeneracy.get("condition_number", float("nan"))
-        eigs_log = degeneracy.get("position_eigenvalues")
-        if eigs_log is not None:
-            cov_trace = float(np.sum(eigs_log))
-            eig0, eig1, eig2 = float(eigs_log[0]), float(eigs_log[1]), float(eigs_log[2])
-        else:
-            cov_trace = eig0 = eig1 = eig2 = float("nan")
-        gating_writer.writerow([
-            i, current_cam_timestamp, len(observations), accumulated_imu,
-            f"{accumulated_disp:.4f}",
-            f"{para_stats['parallax_max_deg']:.4f}",
-            f"{para_stats['parallax_median_deg']:.4f}",
-            para_stats["parallax_count"],
-            f"{cov_trace:.8f}", f"{eig0:.8f}", f"{eig1:.8f}", f"{eig2:.8f}",
-            f"{cond_num:.4f}",
-            int(bool(degeneracy.get("degenerate", False))),
-            degeneracy.get("motion_type", ""),
-            f"{metrics['avg_error_per_factor']:.6f}",
-            f"{metrics['total_error']:.6f}",
-            metrics["n_factors"],
-        ])
-        gating_log_file.flush()
+        # --- Gating analysis logging — moved after ATE so all data is available ---
 
         # --- Adaptive IMU-guided flow + update shared rotation for frontend ---
         prev_use_imu = use_imu_for_flow
@@ -674,9 +882,12 @@ def main():
         # rotation (one-frame latency). Done BEFORE resetting the preintegration below.
         if use_imu_for_flow and accumulated_imu > 0:
             R_body = imu_pipeline.preint.preint.deltaRij().matrix()
-            r_prev_curr_holder[0] = R_cam_body @ R_body @ R_body_cam
+            R_new = R_cam_body @ R_body @ R_body_cam
+            with r_prev_curr_lock:
+                r_prev_curr_holder[0] = R_new
         else:
-            r_prev_curr_holder[0] = None
+            with r_prev_curr_lock:
+                r_prev_curr_holder[0] = None
 
         # --- Update bias and reset preintegration for the next keyframe interval ---
         est_after = optimizer.get_current_estimate()
@@ -701,6 +912,44 @@ def main():
                 print(
                     f"  ATE (RMSE): {ate_rmse_current:.4f} m | Frame error: {ate_errors[-1]:.4f} m"
                 )
+
+        # --- Gating analysis logging (all metrics collected) ---
+        para_stats = optimizer.drain_parallax_stats()
+        cond_num = degeneracy.get("condition_number", float("nan"))
+        eigs_log = degeneracy.get("position_eigenvalues")
+        evecs_log = degeneracy.get("position_eigenvectors")
+        if eigs_log is not None:
+            cov_trace = float(np.sum(eigs_log))
+            eig0, eig1, eig2 = float(eigs_log[0]), float(eigs_log[1]), float(eigs_log[2])
+        else:
+            cov_trace = eig0 = eig1 = eig2 = float("nan")
+        if evecs_log is not None:
+            worst_dir = evecs_log[:, -1]
+        else:
+            worst_dir = np.array([float("nan")] * 3)
+        gating_writer.writerow([
+            i, current_cam_timestamp, len(observations), accumulated_imu,
+            f"{accumulated_disp:.4f}",
+            f"{para_stats['parallax_max_deg']:.4f}",
+            f"{para_stats['parallax_median_deg']:.4f}",
+            para_stats["parallax_count"],
+            f"{cov_trace:.8f}", f"{eig0:.8f}", f"{eig1:.8f}", f"{eig2:.8f}",
+            f"{cond_num:.4f}",
+            int(bool(degeneracy.get("degenerate", False))),
+            degeneracy.get("motion_type", ""),
+            f"{metrics['avg_error_per_factor']:.6f}",
+            f"{metrics['total_error']:.6f}",
+            metrics["n_factors"],
+            len(optimizer.landmark_initialized),
+            len(optimizer.landmark_buffer),
+            len(new_landmarks_3d),
+            df_stats["attempted"], df_stats["promoted"], df_stats["outlier"], df_stats["pending"],
+            f"{ate_rmse_current:.6f}" if ate_rmse_current is not None else "",
+            f"{ate_errors[-1]:.6f}" if ate_rmse_current is not None else "",
+            f"{worst_dir[0]:.6f}", f"{worst_dir[1]:.6f}", f"{worst_dir[2]:.6f}",
+            f"{(time.perf_counter() - t_backend_start) * 1000:.1f}",
+        ])
+        gating_log_file.flush()
 
         # --- E. Enqueue visualization (non-blocking, offloads to vis thread) ---
         lc_ids = []
@@ -765,6 +1014,10 @@ def main():
     gating_log_file.close()
     print(f"Gating analysis log saved to {gating_log_path}")
 
+    rl_action_log_file.close()
+    if rl_agent is not None:
+        print(f"RL action log saved to {rl_action_log_path}")
+
     # --- Final Trajectory Error Summary ---
     if len(ate_est_positions) >= 3:
         ate_rmse, ate_errors, R_align, t_align = compute_ate(
@@ -791,6 +1044,13 @@ def main():
 
     # Cleanup
     visualizer.close()
+
+    # Save promoted depth log for visualization
+    if optimizer.promoted_depth_log:
+        from visualize_depth_filter import save_depth_log
+        save_depth_log(optimizer.promoted_depth_log)
+        optimizer.visualize_factor_graph_3d("factor_graph_3d.html")
+
     print("\n=== VIO processing complete. ===")
     input("Press Enter to exit...")
 
