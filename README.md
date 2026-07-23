@@ -14,6 +14,12 @@ A real-time stereo visual-inertial odometry system, working in a Direct-Method (
   <sub>Cyan colored dots — Re-visited landmarks from previous frames (valid loop closure candidates) <br>Green Trajectory - GT</br></sub>
 </p>
 
+<p align="center">
+  <img src="docs/factor_graph_vis.png" alt="Factor Graph 3D" width="600"/>
+  <br/>
+  <sub>Factor graph visualization — 307 poses, 8035 landmarks observed, ~60k factors. Landmarks colored by depth uncertainty (relative) (green = low σ, red = high σ).</sub>
+</p>
+
 ---
 
 ## System Architecture
@@ -28,6 +34,8 @@ graph LR
     F --> E
     E --> G[Optimized State]
     G --> H[Rerun Visualizer]
+    G -->|params| RL[RL Agent<br/>PPO]
+    RL -->|parallax, min_feat| E
 ```
 
 ---
@@ -72,7 +80,7 @@ Incremental nonlinear optimization via ISAM2 with explicit 3D landmarks.
 | `GenericProjectionFactorCal3_S2` | X(i), L(j) | Pixel reprojection (Huber k=1.345, σ=1.0 px) with body-camera extrinsic |
 | `PriorFactorPoint3` | L(j) | Landmark regularization (σ=1.5 m) |
 
-**Landmark lifecycle**: buffer (first sighting) → promote (3+ poses, parallax ≥ 5°, depth ∈ [0.2, 15] m, cheirality OK) → track (incremental-parallax gate ≥ 2°, grid bucketing 13×13 px).
+**Landmark lifecycle**: buffer (first sighting) → promote (3+ poses, parallax ≥ 2,5°, depth ∈ [0.2, 15] m, cheirality OK) → track (incremental-parallax gate ≥ 2°, grid bucketing 13×13 px).
 
 ### 4. Keyframe Gating (`main_threaded.py`)
 
@@ -107,7 +115,7 @@ Multi-panel [Rerun](https://rerun.io/) viewer with synchronized timelines.
 
 **Factor type:** `GenericProjectionFactorCal3_S2` (explicit 3D landmarks `L(id)`, poses
 `X(i)`, velocities `V(i)`, biases `B(i)`).
-**Estimator:** ISAM2, incremental, `relinearizeThreshold = 0.03`, `relinearizeSkip = 1`.
+**Estimator:** ISAM2, incremental, `relinearizeThreshold = 0.03`, `relinearizeSkip = 2`.
 **Threading:** frontend pushes to a `Queue(maxsize=2)`; the backend pulls. A lock-free
 holder feeds the IMU-derived rotation back to the frontend with one-frame latency.
 
@@ -145,7 +153,7 @@ the graph but their IMU is still integrated (no inertial information is lost).
 ## 3. Landmark Lifecycle (`vio_optimizer.py`)
 
 ```
-First sighting ─► BUFFER ─► (3+ distinct poses & parallax ≥ 5°) ─► PROMOTE ─► TRACK
+First sighting ─► BUFFER ─► (3+ distinct poses & parallax ≥ 2.5°) ─► PROMOTE ─► TRACK
                   (needs 3D)    depth/cheirality checks               incremental-parallax gated
 ```
 
@@ -197,7 +205,7 @@ weak factors; the tighter sigma needs them filtered explicitly.
 | Pose `X(0)` | σ = [0.03 rad ×3, 0.10 m ×3] | Anchor first pose (tight rotation, moderate translation). |
 | Velocity `V(0)` | σ = 0.10 m/s | Anchor initial velocity. |
 | Bias `B(0)` | σ = [0.01 m/s² ×3, 0.003 rad/s ×3] | Trust static calibration, allow online refinement. |
-| Landmark regularization | isotropic σ = 1.5 m | Prevent indeterminate systems during relinearization. |
+| Landmark regularization | isotropic σ = 1 m | Prevent indeterminate systems during relinearization. |
 | Bias random walk | `imu_calib.bias_between_sigmas(dt)` | `BetweenFactorConstantBias`, scaled by interval. |
 
 ### 4.4 Cheirality handling
@@ -296,8 +304,9 @@ flowchart TD
         E -->|No| G[Standard KLT]
         F --> H[Forward-Backward Check]
         G --> H
-        H --> MD[Median Displacement]
-        H --> I[HNSW Loop Candidates]
+        H --> RANSAC{2pt/5pt RANSAC}
+        RANSAC --> MD[Median Displacement]
+        RANSAC --> I[HNSW Loop Candidates]
         MD --> J[Push to Queue]
         I --> J
     end
@@ -306,10 +315,14 @@ flowchart TD
         K[Pull from Queue] --> L[IMU Preintegration ACCUMULATE]
         L --> INIT{init_done?}
         INIT -->|No| KF[Force Keyframe]
-        INIT -->|Yes| GATE{accumulated_disp >= 20px?}
+        INIT -->|Yes| GATE{accumulated_disp >= threshold?}
         GATE -->|No| SKIP[Drop visual, keep IMU]
         GATE -->|Yes| KF
-        KF --> M[Predict NavState]
+        KF --> STATIC{Stationary?}
+        STATIC -->|Yes| ZM[Zero-Velocity + Zero-Motion Prior]
+        STATIC -->|No| RL_STEP
+        ZM --> RL_STEP[RL Agent: Select Params]
+        RL_STEP --> M[Predict NavState]
         M --> N[Add State + IMU Factor at kf_idx]
         N --> O[Process Visual Observations]
     end
@@ -324,9 +337,13 @@ flowchart TD
         V -->|Yes| W[Promote]
     end
 
-    subgraph Promotion["Promotion Gate"]
-        W --> PA[Depth 0.2-15m]
-        PA --> PB[Max Parallax >= 5deg]
+    subgraph Promotion["Promotion Gate (Depth Filter)"]
+        W --> DF[Uncertainty Depth Filter Update]
+        DF --> DFC{Converged? rel_σ < 0.1 & a ≥ 0.5}
+        DFC -->|No, a < 0.3| REJECT[Reject Outlier]
+        DFC -->|No, pending| KEEP[Keep in Buffer]
+        DFC -->|Yes| PA[Depth 0.2-15m]
+        PA --> PB[Parallax ≥ threshold]
         PB --> PC[Cheirality All Cameras]
         PC --> PE[Insert L + Prior + Factors]
     end
@@ -334,18 +351,18 @@ flowchart TD
     subgraph Optimize["ISAM2"]
         PE --> OPT[isam.update]
         T --> OPT
-        OPT --> OPT2{Relinearized > 8?}
+        OPT --> OPT2{Relinearized > 50?}
         OPT2 -->|Yes| OPT3[Extra update]
         OPT2 -->|No| OPT4[Done]
         OPT3 --> OPT4
         OPT4 --> COV[Covariance + Degeneracy]
-        COV --> INITCHK[Init Window: rel_std < 0.002 over 5 KF]
+        COV --> INITCHK[Init Window: rel_std stable over 5 KF]
         INITCHK --> LOG[gating_analysis_log.csv]
         LOG --> ATE[ATE / RTE]
         ATE --> VIS[Visualization]
     end
 
-    subgraph Shared["Shared State (Lock-Free)"]
+    subgraph Shared["Shared State (Lock-Protected)"]
         OPT4 -->|R_prev_curr per keyframe| IMU_ROT[IMU Rotation Holder]
         IMU_ROT -.->|one-frame latency| E
     end
@@ -360,18 +377,18 @@ flowchart TD
 | Aspect | Choice | Rationale |
 |--------|--------|-----------|
 | Factor type | `GenericProjectionFactorCal3_S2` | Explicit landmarks, incremental obs, loop closure |
-| Visual noise | Huber k=1.345, **σ = 1.0 px** | Tighter sigma improved accuracy (paired with parallax gating) |
-| Loop-closure noise | Separate Huber model (σ = 1.0 px) | Tunable loop weighting without touching tracking |
-| Promotion gate | 3+ poses + parallax **≥ 5°** | Well-conditioned triangulation |
+| Visual noise | Huber k=1.345, **σ = 0.5 px** | Tighter sigma improved accuracy (paired with parallax + depth gating) |
+| Loop-closure noise | Separate Huber model (σ = 0.2 px) | Tunable loop weighting without touching tracking |
+| Promotion gate | 3+ poses + parallax **≥ 2.5°** | Well-conditioned triangulation |
 | Observation gate | incremental parallax **≥ 2°** | Drop weak re-observations under tight sigma |
 | Grid bucketing | **13×13 px**, 1 obs/cell/frame | Spatial diversity, avoid clustered factors |
-| Landmark prior | isotropic σ = 1.5 m | Prevent indeterminate systems |
+| Landmark prior | isotropic σ = 1 m | Prevent indeterminate systems |
 | Depth range | **[0.2 m, 15.0 m]** | Reject degenerate triangulations |
 | Keyframe gate | accumulated displacement ≥ **20 px** | Commit only informative frames |
 | Init period | cov-trace rel_std < **0.002** over **5** KF | Stabilize before gating |
 | IMU handling | accumulate across non-keyframes | One IMU factor per keyframe interval |
 | Cheirality | `throwCheirality=False` | Graceful degradation |
-| ISAM2 | relinearizeThreshold=0.03, skip=1 | Aggressive relinearization |
+| ISAM2 | relinearizeThreshold=0.03, skip=2 | Aggressive relinearization |
 | Threading | frontend 1 frame ahead, Queue(2) | Pipelined with backpressure |
 | IMU flow | adaptive on `avg_error < 2.0` | Use only when converged |
 
@@ -403,8 +420,8 @@ FINAL RTE (Relative Trajectory Error)
 
 ## 12. Change Log
 
-1. **Pixel noise 1.5 → 1.0 px** — improved accuracy.
-2. **Promotion parallax 2.5° → 5°**, depth range `[0.25, 20] → [0.2, 15] m`, grid cell
+1. **Pixel noise 1.5 → 0.5 px** — improved accuracy, we can relax noise due to the new depth-uncertainty filter.
+2. **Promotion parallax 2.5°**, depth range `[0.25, 20] → [0.2, 15] m`, grid cell
    `16 → 13 px` — stricter landmark quality.
 3. **Loop-closure noise model** — separate, tunable `loop_pixel_noise`.
 4. **Incremental-parallax observation gate** (`min_obs_parallax_deg = 2°`) — filters weak
@@ -413,3 +430,54 @@ FINAL RTE (Relative Trajectory Error)
    (rel_std < 0.002 over 5 KF) + **IMU accumulation** across skipped frames.
 6. **Instrumentation** — `parallax_log` / `drain_parallax_stats`, `gating_analysis_log.csv`,
    `analyze_gating.py`.
+7. **Probabilistic depth filter (_Inspired by SVO-PRO paper_)** — Gaussian-Uniform mixture in inverse depth gates landmark
+   promotion. Models each landmark's inverse depth as a two-component mixture:
+
+   $$p(\rho) \;=\; a \cdot \mathcal{N}(\rho;\, \mu,\, \sigma^2) \;+\; (1 - a) \cdot \mathcal{U}(\rho_{\min},\, \rho_{\max})$$
+
+   where $\rho = 1/d$ is inverse depth, $a \in [0, 1]$ is the **inlier probability**, the
+   Gaussian component captures the true depth, and the uniform component absorbs outlier
+   measurements over the range $[\frac{1}{d_{\max}},\, \frac{1}{d_{\min}}]$.
+
+   **Bayesian update** — each new depth measurement $z = 1/d_{\text{obs}}$ updates the
+   filter via:
+
+   $$S = \sigma^2 + \tau^2, \qquad p_G = \mathcal{N}(z;\, \mu,\, S), \qquad p_U = \frac{1}{\rho_{\max} - \rho_{\min}}$$
+
+   $$a' = \frac{a \cdot p_G}{a \cdot p_G + (1 - a) \cdot p_U}$$
+
+   $$K = \frac{\sigma^2}{S}, \qquad \mu' = \mu + K(z - \mu), \qquad \sigma'^2 = (1 - K)\,\sigma^2$$
+
+   where $\tau$ is the inverse-depth measurement noise std. The inlier probability $a$
+   rises when measurements are consistent with the Gaussian mode and falls when they look
+   uniformly distributed (outlier). The Gaussian mean and variance follow a standard
+   Kalman update.
+
+   **Convergence criteria** — a landmark is promoted only when all three hold:
+   - Relative uncertainty: $\sqrt{\sigma^2} / |\mu| < 0.1$
+   - Absolute depth sigma: $\sigma_d = \sqrt{\sigma^2} \cdot d^2 < 0.25\,\text{m}$
+   - Inlier probability: $a \geq 0.5$
+
+   Landmarks with $a < 0.3$ after 3+ measurements are permanently rejected as outliers.
+
+8. **2pt/5pt RANSAC geometric outlier rejection** — after KLT forward-backward consistency,
+   epipolar RANSAC removes geometrically inconsistent tracks. 2-point (translation-only,
+   Sampson distance) when IMU rotation is available; 5-point (full essential matrix) fallback.
+9. **RL agent integration** — PPO agent selects parallax threshold, min tracked features,
+   and min observation parallax at each keyframe based on live optimizer diagnostics,
+   covariance eigenvalues, and sliding-window ATE.
+10. **Zero-motion constraints** — stationary detection (accumulated displacement < 1 px)
+    adds zero-velocity priors (σ = 0.01 m/s) and identity `BetweenFactorPose3` constraints
+    to prevent drift during static periods.
+11. **Thread-safe IMU rotation sharing** — `r_prev_curr_holder` protected by `Lock` to
+    guarantee the frontend reads a complete, consistent rotation matrix.
+12. **IMU preintegration dt fix** — `integrate()` now tracks `end_time` across calls,
+    computing dt from the last integrated sample rather than the previous sample in the
+    current batch. Fixes incorrect dt when batches span non-contiguous time intervals.
+13. **Factor graph 3D visualization** — `visualize_factor_graph_3d()` renders poses,
+    landmarks (colored by depth uncertainty), projection/IMU/between factor edges as an
+    interactive Plotly HTML file. Depth filter visualization tool
+    (`visualize_depth_filter.py`) with Open3D ellipsoids or matplotlib fallback.
+14. **Expanded gating log** — `gating_analysis_log.csv` now includes landmark/buffer counts,
+    depth filter stats (attempted/promoted/outlier/pending), ATE RMSE + per-frame error,
+    worst covariance eigenvector.
