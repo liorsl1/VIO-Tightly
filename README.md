@@ -1,6 +1,6 @@
 # VIO-Tightly — Tightly-Coupled Visual-Inertial SLAM
 
-A thorough implementation of stereo visual-inertial odometry + mapping system, working in a Direct-Method (No feature-matching, minimization of photometric error with KLT) using factor graph optimization (GTSAM/ISAM2) with explicit landmark management, keyframe-based graph growth, loop closure detection, Inverse depth-certainty gating and live 3D visualization.
+A thorough implementation of stereo visual-inertial odometry + mapping system, working in a Direct-Method (No feature-matching, minimization of photometric error with KLT) using factor graph optimization (GTSAM/ISAM2) with explicit landmark management, keyframe-based graph growth, loop closure detection, Bayesian Inverse-depth gating and live 3D visualization.
 
 ![Pipeline](https://img.shields.io/badge/Backend-GTSAM_ISAM2-blue) ![Features](https://img.shields.io/badge/Frontend-XFeat-green) ![Viz](https://img.shields.io/badge/Viz-Rerun-orange)
 
