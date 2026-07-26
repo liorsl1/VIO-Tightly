@@ -5,18 +5,17 @@ Reads the promoted_depth_log from the optimizer and renders each landmark as:
   - A point colored by inlier probability (green=confident, red=marginal)
   - An ellipsoid scaled by the depth uncertainty (σ_d in meters)
 
+Colors of uncertainties are relative - red are still in the accepted threshold.
 Usage:
     After running main_threaded.py, this script loads the saved log and visualizes.
     Or: import and call visualize_promoted_depths(optimizer.promoted_depth_log) inline.
 
 Requires: open3d (pip install open3d)
 """
-
 import numpy as np
 import pickle
 import sys
 import os
-
 
 def compute_depth_ellipsoid(pt_world, df_mu, df_sigma2, viewing_dir=None):
     """Compute ellipsoid radii from depth filter state.
