@@ -139,6 +139,8 @@ class GraphOptimizer:
         # --- Depth filter parameters (Vogiatzis Gaussian-Uniform mixture) ---
         # Only landmarks whose depth converges below this relative uncertainty get promoted.
         self.depth_filter_enabled = True
+        self.depth_d_min = 0.2           # Min valid depth (meters)
+        self.depth_d_max = 17.0          # Max valid depth (meters)
         self.depth_tau = 0.02        # Inverse-depth measurement noise std (m^-1)
         self.depth_convergence_rel = 0.1  # Max relative sigma for convergence
         self.depth_max_sigma_m = 0.25     # Max absolute depth sigma (meters)
@@ -418,7 +420,7 @@ class GraphOptimizer:
             if distinct_poses < 2:
                 continue
             depth = buf["point_cam"][2]
-            if depth < 0.2 or depth > 15.0:
+            if depth < self.depth_d_min or depth > self.depth_d_max:
                 continue
             # Score: prioritize high inlier probability and many observations
             score = buf["df_a"] * buf["df_n"]
@@ -502,7 +504,7 @@ class GraphOptimizer:
         buf = self.landmark_buffer[landmark_id]
         # Validate: reject landmarks with degenerate camera-frame depth
         depth = buf["point_cam"][2]
-        if depth < 0.2 or depth > 15.0:
+        if depth < self.depth_d_min or depth > self.depth_d_max:
             # Bad triangulation — remove permanently
             self.landmark_buffer.pop(landmark_id)
             return
@@ -662,7 +664,7 @@ class GraphOptimizer:
             buf: Landmark buffer dict containing filter state (df_mu, df_sigma2, df_a, df_n).
             observed_depths: Depth measurements from different cameras (meters).
         """
-        d_min, d_max = 0.1, 20.0
+        d_min, d_max = self.depth_d_min, self.depth_d_max
         uniform_range = 1.0 / d_min - 1.0 / d_max  # range in inverse depth
         p_uniform = 1.0 / uniform_range
         tau2 = self.depth_tau ** 2
