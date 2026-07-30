@@ -1,5 +1,7 @@
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
+
+from vio_utils import angle_between_deg, gaussian_uniform_update
 
 try:
     import gtsam
@@ -9,19 +11,23 @@ except ImportError:  # Allow file existence without immediate dependency
 
 
 class GraphOptimizer:
-    """
-    Tightly coupled VIO/SLAM backend using GTSAM with explicit landmarks.
+    """Tightly coupled VIO/SLAM backend: GTSAM ISAM2 over explicit landmark variables.
 
-    Uses GenericProjectionFactorPose3Point3 for visual factors, allowing:
-      - Incremental observation addition to existing landmarks in ISAM2
-      - Direct access to optimized 3D landmark positions
-      - Natural loop closure integration via re-observation factors
-      - Robust Huber loss on reprojection errors
+    Explicit landmarks (rather than smart factors) are what allow observations to be
+    added to an existing landmark incrementally, its optimized 3D position to be read
+    back, and a loop closure to be expressed as one more re-observation.
     """
 
     def __init__(
-        self, use_isam: bool = True, body_P_sensor: np.ndarray = None, imu_calib=None
+        self, use_isam: bool = True, body_P_sensor: np.ndarray = None, imu_calib=None,
+        enable_landmarks: bool = True,
     ):
+        # Ablation switch. False makes the backend discard every visual observation, so
+        # no landmark variables and no projection factors ever enter the graph and what
+        # remains is the inertial chain plus the priors and zero-motion constraints.
+        # The resulting ATE is the floor vision is measured against.
+        self.enable_landmarks = enable_landmarks
+
         if gtsam is None:
             self.isam = None
             self.graph = None
@@ -46,14 +52,9 @@ class GraphOptimizer:
 
         self.use_isam = use_isam
         self.isam_params = gtsam.ISAM2Params()
-        # If I want to use Dogleg insead of standard Gauss-Newton, I can set these parameters:
-        # dogleg_params = gtsam.ISAM2DoglegParams()
-        # dogleg_params.setInitialDelta(0.5)
-        # self.isam_params.setOptimizationParams(dogleg_params)
         self.isam_params.setRelinearizeThreshold(0.03)
         self.isam_params.relinearizeSkip = 2
         self.isam_params.cacheLinearizedFactors = True
-        # self.isam_params.evaluateNonlinearError = True
         self.isam = gtsam.ISAM2(self.isam_params) if use_isam else None
         self.graph = gtsam.NonlinearFactorGraph()
         self.initial = gtsam.Values()
@@ -81,6 +82,12 @@ class GraphOptimizer:
         # Cached estimate (invalidated after each optimize call)
         self._cached_estimate = None
 
+        # Diagnostics throttling: full-graph error evaluation is O(n_factors), so it
+        # runs every N keyframes and the value is held in between. See diagnostics().
+        self.diagnostics_interval = 10
+        self._diag_total_error = 0.0
+        self._diag_last_idx = None
+
         # --- Noise models ---
         # Prior: tight rotation (0.03 rad ≈ 1.7°), moderate translation (0.2m)
         self.prior_pose_noise = gtsam.noiseModel.Diagonal.Sigmas(
@@ -98,7 +105,13 @@ class GraphOptimizer:
         # during relinearization, but loose enough not to bias converged estimates.
         # Tunable at runtime via self.landmark_reg_sigma — the noise model is rebuilt
         # on each landmark promotion to reflect the current setting.
-        self.landmark_reg_sigma = 1  # meters (≈3× max depth filter uncertainty)
+        self.landmark_reg_sigma = 1  # meters — sigma PERPENDICULAR to the viewing ray
+        # Along-ray sigma = clip(k * sigma_z, landmark_reg_sigma, max). Widening the
+        # prior in the ill-conditioned (depth) direction keeps it from asserting more
+        # depth confidence than the triangulation geometry supports. Clipped from
+        # below by landmark_reg_sigma so the prior is never TIGHTER than isotropic.
+        self.landmark_reg_along_k = 2     # how many sigma_z to allow along the ray
+        self.landmark_reg_along_max = 6  # meters — numerical sanity ceiling
 
         # Robust pixel noise (Huber) for projection factors
         pixel_sigma = 0.5  # pixels
@@ -123,46 +136,87 @@ class GraphOptimizer:
         self._frame_occupied_cells = {}  # {state_idx: set of (row, col) tuples}
 
         # Tunable thresholds (can be changed at runtime by RL agent)
-        self.parallax_threshold = 2.5  # degrees — minimum parallax for landmark promotion
+        self.parallax_threshold = 5  # degrees — minimum parallax for landmark promotion
 
         # Minimum incremental parallax (deg) required to add a new observation factor to
         # an already-initialized landmark. A re-observation whose camera has barely moved
         # (relative to the last contributing view) adds little geometric information but,
         # at a tight pixel sigma, can over-constrain the pose; gating it improves accuracy.
-        self.min_obs_parallax_deg = 2
+        self.min_obs_parallax_deg = 4.5
 
         # Parallax instrumentation: max-parallax angles (deg) computed during landmark
         # promotion attempts since the last drain. Used to correlate the geometric
         # triangulation baseline with graph conditioning (covariance / condition number).
         self.parallax_log = []
 
+        # --- Gate instrumentation ------------------------------------------------
+        # Every exit path in add_landmark_observation / _promote_landmark increments a
+        # counter, so we can see WHERE observations are lost instead of guessing.
+        # Pure bookkeeping: no effect on the graph.
+        self.gate_stats = self._zero_gate_stats()
+
         # --- Depth filter parameters (Vogiatzis Gaussian-Uniform mixture) ---
         # Only landmarks whose depth converges below this relative uncertainty get promoted.
         self.depth_filter_enabled = True
         self.depth_d_min = 0.2           # Min valid depth (meters)
-        self.depth_d_max = 17.0          # Max valid depth (meters)
+        self.depth_d_max = 15.0          # Max valid depth (meters)
         self.depth_tau = 0.02        # Inverse-depth measurement noise std (m^-1)
         self.depth_convergence_rel = 0.1  # Max relative sigma for convergence
         self.depth_max_sigma_m = 0.25     # Max absolute depth sigma (meters)
         self.depth_min_inlier = 0.5   # Min inlier probability for convergence
         self.depth_outlier_thresh = 0.3  # Below this → landmark is outlier, remove
-        self.buffer_max_age_kf = 0      # Prune buffer entries older than this many keyframes
+        self.buffer_max_age_kf = 80      # Drop buffered landmarks unseen for this many keyframes
         self._depth_stats = {"attempted": 0, "promoted": 0, "outlier": 0, "pending": 0}
         self.promoted_depth_log = []  # [(landmark_id, pt3_world, depth_mu, depth_sigma2, df_a, df_n)]
         self._static_promotion_done = False  # One-time cold-start bypass
 
+    GATE_KEYS = (
+        # Case 1: landmark already in the graph
+        "g_frozen", "g_behind", "g_parallax", "g_cell", "g_accepted",
+        # Case 2: landmark waiting in the buffer
+        "b_cell", "b_appended",
+        # Case 3: first sighting
+        "n_no3d", "n_cell", "n_buffered",
+        # _promote_landmark outcomes
+        "p_attempts", "p_depth_range", "p_cheirality", "p_outlier", "p_pending",
+        "p_parallax", "p_promoted", "p_flushed_factors",
+    )
+
+    def _zero_gate_stats(self):
+        """Fresh all-zero gate counter dict.
+
+        Returns:
+            Dict mapping every GATE_KEYS entry to 0.
+        """
+        return {k: 0 for k in self.GATE_KEYS}
+
+    def drain_gate_stats(self):
+        """Return and clear the per-keyframe gate counters.
+
+        Returns:
+            Dict of counts keyed by GATE_KEYS.
+        """
+        st = dict(self.gate_stats)
+        self.gate_stats = self._zero_gate_stats()
+        return st
+
     def _make_projection_factor(
         self, measurement, state_idx: int, landmark_id: int, noise=None
     ):
-        """Create a projection factor with throwCheirality=False.
+        """Build a projection factor that degrades instead of throwing on cheirality.
 
-        Setting throwCheirality=False makes the factor return zero error (and
-        zero Jacobians) when the landmark projects behind the camera, preventing
-        IndeterminateLinearSystemException during ISAM2 relinearization.
+        throwCheirality=False makes the factor yield zero error and zero Jacobians when
+        the landmark falls behind the camera, which keeps ISAM2 relinearization from
+        raising IndeterminateLinearSystemException mid-run.
 
         Args:
-            noise: Optional noise model override (e.g. tighter loop-closure noise).
-                   Defaults to the standard 1.5px robust pixel noise.
+            measurement: gtsam.Point2 pixel measurement.
+            state_idx: Pose state index.
+            landmark_id: Landmark index.
+            noise: Optional noise override; defaults to the robust pixel noise.
+
+        Returns:
+            A GenericProjectionFactorCal3_S2.
         """
         if noise is None:
             noise = self.pixel_noise
@@ -190,12 +244,55 @@ class GraphOptimizer:
                 False,
             )
 
-    def _is_cell_available(self, state_idx: int, uv: np.ndarray) -> bool:
-        """Check if this pixel's grid cell is unoccupied for this frame.
+    def _body_pose(self, state_idx: int, default=None):
+        """World pose of body frame X(state_idx), preferring the optimized estimate.
 
-        Ensures spatial distribution of observations — at most one
-        projection factor per grid cell per pose, maximizing the
-        geometric information contributed by visual factors.
+        Falls back to the pending initial values because a landmark can be evaluated
+        in the same keyframe its pose was created, before ISAM2 has seen it.
+
+        Args:
+            state_idx: Pose state index.
+            default: Value to return when the pose is unknown.
+
+        Returns:
+            gtsam.Pose3 for the body frame, or `default`.
+        """
+        estimate = self.get_current_estimate()
+        if estimate is not None and estimate.exists(X(state_idx)):
+            return estimate.atPose3(X(state_idx))
+        if self.initial.exists(X(state_idx)):
+            return self.initial.atPose3(X(state_idx))
+        return default
+
+    def _camera_pose(self, state_idx: int, default=None):
+        """World pose of the camera frame for X(state_idx), via body_P_sensor.
+
+        Args:
+            state_idx: Pose state index.
+            default: Value to return when the pose is unknown.
+
+        Returns:
+            gtsam.Pose3 for the camera frame, or `default`.
+        """
+        world_T_body = self._body_pose(state_idx)
+        if world_T_body is None:
+            return default
+        if self.body_P_sensor is not None:
+            return world_T_body.compose(self.body_P_sensor)
+        return world_T_body
+
+    def _is_cell_available(self, state_idx: int, uv: np.ndarray) -> bool:
+        """Claim this pixel's grid cell for this frame, or reject if already taken.
+
+        Capping observations at one per cell per pose spreads visual factors over the
+        image; clustered measurements are near-redundant constraints on the pose.
+
+        Args:
+            state_idx: Pose state index.
+            uv: Pixel measurement [u, v].
+
+        Returns:
+            True if the cell was free (and is now claimed), False otherwise.
         """
         col = int(uv[0]) // self.obs_cell_size
         row = int(uv[1]) // self.obs_cell_size
@@ -213,6 +310,17 @@ class GraphOptimizer:
     # ==================== Initialization ====================
 
     def add_initial_state(self, pose_wb, vel_w: np.ndarray, bias, set_priors=True):
+        """Insert state 0 and, optionally, the priors that anchor the whole graph.
+
+        Args:
+            pose_wb: Initial body pose, as gtsam.Pose3 or a 4x4 matrix.
+            vel_w: (3,) initial world-frame velocity.
+            bias: Initial gtsam.imuBias.ConstantBias.
+            set_priors: Whether to add pose/velocity/bias priors on X(0).
+
+        Returns:
+            None.
+        """
         if gtsam is None:
             return
         if isinstance(pose_wb, gtsam.Pose3):
@@ -241,11 +349,14 @@ class GraphOptimizer:
     # ==================== IMU Factors ====================
 
     def add_zero_velocity_prior(self, state_idx: int, sigma: float = 0.01):
-        """Add a tight zero-velocity prior for stationary periods.
+        """Pin velocity to zero during a detected stationary period.
 
         Args:
             state_idx: State index to constrain.
-            sigma: Velocity sigma in m/s (default 0.01 = 1cm/s).
+            sigma: Velocity sigma in m/s.
+
+        Returns:
+            None.
         """
         if gtsam is None:
             return
@@ -256,13 +367,19 @@ class GraphOptimizer:
 
     def add_zero_motion_constraint(self, prev_idx: int, curr_idx: int,
                                    rot_sigma: float = 0.001, trans_sigma: float = 0.005):
-        """Add a tight identity BetweenFactor<Pose3> for stationary periods.
+        """Tie two consecutive poses together during a stationary period.
 
-        Constrains X(curr_idx) to be (nearly) identical to X(prev_idx).
+        A tight identity BetweenFactor stops IMU bias from integrating into phantom
+        motion while the platform is not moving.
 
         Args:
-            rot_sigma: Rotation noise sigma in rad (default 0.001 ≈ 0.06°).
-            trans_sigma: Translation noise sigma in m (default 0.005 = 5mm).
+            prev_idx: Earlier state index.
+            curr_idx: Later state index.
+            rot_sigma: Rotation noise sigma in rad.
+            trans_sigma: Translation noise sigma in m.
+
+        Returns:
+            None.
         """
         if gtsam is None:
             return
@@ -274,7 +391,16 @@ class GraphOptimizer:
         )
 
     def add_state_variable(self, idx, nav_state, bias):
-        """Add a new state (pose, velocity, bias) to the initial values."""
+        """Add pose/velocity/bias variables for a new keyframe.
+
+        Args:
+            idx: State index to create.
+            nav_state: gtsam.NavState holding the predicted pose and velocity.
+            bias: Initial bias estimate for this state.
+
+        Returns:
+            None.
+        """
         if gtsam is None:
             return
         self.initial.insert(X(idx), nav_state.pose())
@@ -283,6 +409,19 @@ class GraphOptimizer:
         self.state_index = max(self.state_index, idx)
 
     def add_imu_factor(self, preint, prev_idx: int, curr_idx: int):
+        """Add the IMU factor for an interval, plus its bias random-walk factor.
+
+        The bias BetweenFactor is scaled by the actual preintegration interval, so a
+        long keyframe gap correctly allows the bias more room to drift.
+
+        Args:
+            preint: Preintegrated measurements spanning the interval.
+            prev_idx: State index at the start of the interval.
+            curr_idx: State index at the end.
+
+        Returns:
+            None.
+        """
         if gtsam is None or preint is None:
             return
         fac = gtsam.ImuFactor(
@@ -311,19 +450,21 @@ class GraphOptimizer:
         K: np.ndarray,
         landmark_3d: np.ndarray = None,
     ):
-        """
-        Add a projection factor between pose X(state_idx) and landmark L(landmark_id).
+        """Route one observation: straight to the graph, into the buffer, or dropped.
 
-        Landmarks are buffered until they have observations from 2+ different poses.
-        Once promoted, all buffered observations are flushed as projection factors
-        without needing an artificial prior.
+        A landmark cannot enter the graph on first sight — a single view fixes bearing
+        but not depth. It waits in the buffer until enough distinct poses have seen it,
+        then all its observations are flushed together (see _promote_landmark).
 
         Args:
             landmark_id: Unique landmark identifier.
             state_idx: Pose state index this observation comes from.
-            uv: 2D pixel measurement [u, v] in rectified image.
+            uv: 2D pixel measurement [u, v] in the rectified image.
             K: 3x3 rectified camera intrinsics.
-            landmark_3d: Initial 3D position in CAMERA frame (required for first observation).
+            landmark_3d: 3D position in the CAMERA frame; required on first sighting.
+
+        Returns:
+            None.
         """
         if gtsam is None:
             return
@@ -336,9 +477,11 @@ class GraphOptimizer:
         if landmark_id in self.landmark_initialized:
             # Skip frozen (high-uncertainty) landmarks
             if landmark_id in self.landmark_frozen:
+                self.gate_stats["g_frozen"] += 1
                 return
             # Depth check: skip if landmark is behind the camera from this pose
             if not self._is_landmark_in_front(landmark_id, state_idx):
+                self.gate_stats["g_behind"] += 1
                 return
             # Parallax check: skip near-zero-parallax re-observations. If the camera has
             # barely moved relative to the last view that contributed a factor for this
@@ -347,10 +490,13 @@ class GraphOptimizer:
             # Gating by incremental parallax keeps only views that widen the baseline.
             parallax = self._obs_parallax_deg(landmark_id, state_idx)
             if parallax is not None and parallax < self.min_obs_parallax_deg:
+                self.gate_stats["g_parallax"] += 1
                 return
             # Cell check: skip if this pixel's grid cell is already occupied for this pose
             if not self._is_cell_available(state_idx, uv):
+                self.gate_stats["g_cell"] += 1
                 return
+            self.gate_stats["g_accepted"] += 1
             measurement = gtsam.Point2(float(uv[0]), float(uv[1]))
             self.graph.add(
                 self._make_projection_factor(measurement, state_idx, landmark_id)
@@ -368,28 +514,37 @@ class GraphOptimizer:
         if landmark_id in self.landmark_buffer:
             # Cell check: ensure spatial distribution even for buffered landmarks
             if not self._is_cell_available(state_idx, uv):
+                self.gate_stats["b_cell"] += 1
                 return
+            self.gate_stats["b_appended"] += 1
             buf = self.landmark_buffer[landmark_id]
             buf["observations"].append((state_idx, np.array(uv, dtype=float)))
-            # Check if we have observations from 3+ distinct poses
-            distinct_poses = set(s for s, _ in buf["observations"])
-            if len(distinct_poses) >= 3:
+            # The distinct-pose set is maintained incrementally rather than rebuilt from
+            # the observation list on every append, which was O(k) per observation and
+            # therefore O(k^2) over the life of a buffered track.
+            buf["poses"].add(state_idx)
+            n_distinct = len(buf["poses"])
+            if n_distinct >= 3:
                 # Only attempt promotion every 2 new distinct poses after the initial 3,
                 # to avoid repeated expensive parallax checks on every observation
-                if len(distinct_poses) == 3 or len(distinct_poses) % 2 == 0:
+                if n_distinct == 3 or n_distinct % 2 == 0:
                     self._promote_landmark(landmark_id)
             return
 
         # --- Case 3: First time seeing this landmark — add to buffer ---
         if landmark_3d is None:
+            self.gate_stats["n_no3d"] += 1
             return  # Cannot initialize without 3D position
         # Cell check: claim this cell for the first observation
         if not self._is_cell_available(state_idx, uv):
+            self.gate_stats["n_cell"] += 1
             return
+        self.gate_stats["n_buffered"] += 1
         self.landmark_buffer[landmark_id] = {
             "point_cam": np.array(landmark_3d, dtype=float),
             "first_state": state_idx,
             "observations": [(state_idx, np.array(uv, dtype=float))],
+            "poses": {state_idx},  # distinct pose indices, kept in sync with observations
             # Depth filter state (Vogiatzis Gaussian-Uniform mixture in inverse depth)
             "df_mu": 1.0 / max(landmark_3d[2], 0.1),      # inverse depth mean
             "df_sigma2": (0.2 / max(landmark_3d[2], 0.1)) ** 2,  # initial ~20% rel uncertainty
@@ -398,13 +553,18 @@ class GraphOptimizer:
         }
 
     def force_promote_top_n(self, n: int = 100) -> int:
-        """One-time cold-start promotion: bypass depth filter and promote the top N
-        buffered landmarks ranked by quality (inlier probability * observation count).
+        """Cold-start bypass: promote the best buffered landmarks without the filters.
 
-        Only fires once (sets _static_promotion_done). Used when the system exits
-        the static period so the graph has visual constraints before IMU drift accumulates.
+        Fires once, when the system leaves its static period, so the graph has visual
+        constraints before IMU drift accumulates — at that point no landmark has the
+        parallax history the normal gates require. Ranked by inlier probability times
+        observation count; only cheirality is still enforced.
 
-        Returns number of landmarks actually promoted.
+        Args:
+            n: Maximum number of landmarks to promote.
+
+        Returns:
+            Number of landmarks actually promoted.
         """
         if self._static_promotion_done:
             return 0
@@ -437,19 +597,10 @@ class GraphOptimizer:
             pt_gtsam = gtsam.Point3(*pt3_world)
             valid = True
             for s_idx, _uv in buf["observations"]:
-                estimate = self.get_current_estimate()
-                if estimate is not None and estimate.exists(X(s_idx)):
-                    world_T_body = estimate.atPose3(X(s_idx))
-                elif self.initial.exists(X(s_idx)):
-                    world_T_body = self.initial.atPose3(X(s_idx))
-                else:
+                world_T_cam = self._camera_pose(s_idx)
+                if world_T_cam is None:
                     continue
-                if self.body_P_sensor is not None:
-                    world_T_cam = world_T_body.compose(self.body_P_sensor)
-                else:
-                    world_T_cam = world_T_body
-                pt_cam = world_T_cam.transformTo(pt_gtsam)
-                if pt_cam[2] < 0.2:
+                if world_T_cam.transformTo(pt_gtsam)[2] < 0.2:
                     valid = False
                     break
             if not valid:
@@ -462,27 +613,7 @@ class GraphOptimizer:
                 lm_id, pt3_world.copy(),
                 buf["df_mu"], buf["df_sigma2"], buf["df_a"], buf["df_n"],
             ))
-
-            self.initial.insert(L(lm_id), gtsam.Point3(*pt3_world))
-            self.landmark_initialized.add(lm_id)
-            self.landmark_obs_count[lm_id] = 0
-
-            reg_noise = gtsam.noiseModel.Isotropic.Sigma(3, self.landmark_reg_sigma)
-            self.graph.add(
-                gtsam.PriorFactorPoint3(L(lm_id), gtsam.Point3(*pt3_world), reg_noise)
-            )
-
-            for s_idx, uv in buf["observations"]:
-                measurement = gtsam.Point2(float(uv[0]), float(uv[1]))
-                self.graph.add(
-                    self._make_projection_factor(measurement, s_idx, lm_id)
-                )
-                self.landmark_obs_count[lm_id] += 1
-
-            last_s_idx = buf["observations"][-1][0]
-            cam_pos = self._camera_position(last_s_idx)
-            if cam_pos is not None:
-                self.landmark_last_factor_cam[lm_id] = cam_pos
+            self._commit_landmark(lm_id, buf, pt3_world)
             promoted += 1
 
         if promoted > 0:
@@ -490,22 +621,26 @@ class GraphOptimizer:
         return promoted
 
     def _promote_landmark(self, landmark_id: int):
-        """Move a landmark from the buffer into the factor graph (ISAM2).
+        """Move a buffered landmark into the graph once its geometry is trustworthy.
 
-        Called when a buffered landmark has 3+ observations from different poses.
-        Adds the landmark variable + all buffered projection factors at once.
-        Validates that the landmark is geometrically visible (positive depth) from
-        all observing poses before committing — prevents indeterminate systems from
-        zero-Jacobian projection factors.
+        Gates in order: depth range, cheirality from every observing pose, depth-filter
+        convergence, then parallax. A failed gate returns without popping the buffer so
+        the landmark can accumulate more views and retry — except depth range and
+        depth-filter outliers, which are permanent rejections.
 
-        Returns without popping the buffer if parallax/depth checks fail,
-        allowing the landmark to accumulate more observations and retry later.
+        Args:
+            landmark_id: Buffered landmark to attempt promoting.
+
+        Returns:
+            None.
         """
         buf = self.landmark_buffer[landmark_id]
+        self.gate_stats["p_attempts"] += 1
         # Validate: reject landmarks with degenerate camera-frame depth
         depth = buf["point_cam"][2]
         if depth < self.depth_d_min or depth > self.depth_d_max:
             # Bad triangulation — remove permanently
+            self.gate_stats["p_depth_range"] += 1
             self.landmark_buffer.pop(landmark_id)
             return
 
@@ -514,25 +649,22 @@ class GraphOptimizer:
 
         # Validate: minimum parallax angle between observing poses
         max_parallax = self._max_parallax_deg(pt3_world, buf["observations"])
+        # Record every promotion attempt, including the ones that get rejected below —
+        # drain_parallax_stats() reports these per keyframe. Without this append the
+        # gating log's parallax columns are identically zero.
+        self.parallax_log.append(float(max_parallax))
 
         # Validate: landmark must be in front of ALL observing cameras + collect depths
         pt_gtsam = gtsam.Point3(*pt3_world)
         observed_depths = []
         for s_idx, _uv in buf["observations"]:
-            estimate = self.get_current_estimate()
-            if estimate is not None and estimate.exists(X(s_idx)):
-                world_T_body = estimate.atPose3(X(s_idx))
-            elif self.initial.exists(X(s_idx)):
-                world_T_body = self.initial.atPose3(X(s_idx))
-            else:
+            world_T_cam = self._camera_pose(s_idx)
+            if world_T_cam is None:
                 continue
-            if self.body_P_sensor is not None:
-                world_T_cam = world_T_body.compose(self.body_P_sensor)
-            else:
-                world_T_cam = world_T_body
             pt_cam = world_T_cam.transformTo(pt_gtsam)
             if pt_cam[2] < 0.2:  # Behind camera or too close
                 # Keep in buffer — pose estimates may improve later
+                self.gate_stats["p_cheirality"] += 1
                 return
             observed_depths.append(float(pt_cam[2]))
 
@@ -543,6 +675,7 @@ class GraphOptimizer:
             if buf["df_a"] < self.depth_outlier_thresh and buf["df_n"] >= 3:
                 # Landmark is likely an outlier — remove permanently
                 self._depth_stats["outlier"] += 1
+                self.gate_stats["p_outlier"] += 1
                 self.landmark_buffer.pop(landmark_id)
                 return
             rel_sigma = np.sqrt(buf["df_sigma2"]) / max(abs(buf["df_mu"]), 1e-10)
@@ -554,13 +687,16 @@ class GraphOptimizer:
                     or buf["df_a"] < self.depth_min_inlier):
                 # Not converged yet — keep in buffer for more observations
                 self._depth_stats["pending"] += 1
+                self.gate_stats["p_pending"] += 1
                 return
 
         # Parallax gate (checked after depth filter so filter can accumulate)
         if max_parallax < self.parallax_threshold:
+            self.gate_stats["p_parallax"] += 1
             return
 
         # All checks passed — pop from buffer and commit to graph
+        self.gate_stats["p_promoted"] += 1
         self.landmark_buffer.pop(landmark_id)
         if self.depth_filter_enabled:
             self._depth_stats["promoted"] += 1
@@ -570,42 +706,63 @@ class GraphOptimizer:
                 buf["df_mu"], buf["df_sigma2"], buf["df_a"], buf["df_n"],
             ))
 
+        self._commit_landmark(landmark_id, buf, pt3_world, count_flushed=True)
+
+    def _commit_landmark(self, landmark_id: int, buf: dict, pt3_world: np.ndarray,
+                         count_flushed: bool = False):
+        """Insert a landmark variable, its prior, and all its buffered factors.
+
+        The regularization prior is what keeps the linear system non-singular; the
+        buffered observations are flushed together so the landmark enters the graph
+        already constrained by every view that earned it.
+
+        Args:
+            landmark_id: Landmark being committed.
+            buf: Its buffer entry (observations and depth-filter state).
+            pt3_world: (3,) world position to initialize at.
+            count_flushed: Whether to count the flushed factors in gate stats.
+
+        Returns:
+            None.
+        """
         self.initial.insert(L(landmark_id), gtsam.Point3(*pt3_world))
         self.landmark_initialized.add(landmark_id)
         self.landmark_obs_count[landmark_id] = 0
 
-        # Regularization prior to prevent indeterminate linear system
-        # Uses current landmark_reg_sigma
-        reg_noise = gtsam.noiseModel.Isotropic.Sigma(3, self.landmark_reg_sigma)
+        reg_noise = self._landmark_prior_noise(pt3_world, buf)
         self.graph.add(
-            gtsam.PriorFactorPoint3(
-                L(landmark_id),
-                gtsam.Point3(*pt3_world),
-                reg_noise,
-            )
+            gtsam.PriorFactorPoint3(L(landmark_id), gtsam.Point3(*pt3_world), reg_noise)
         )
 
-        # Add all buffered projection factors
         for s_idx, uv in buf["observations"]:
             measurement = gtsam.Point2(float(uv[0]), float(uv[1]))
             self.graph.add(
                 self._make_projection_factor(measurement, s_idx, landmark_id)
             )
             self.landmark_obs_count[landmark_id] += 1
+            if count_flushed:
+                self.gate_stats["p_flushed_factors"] += 1
 
         # Seed the incremental-parallax reference with the most recent observing view
-        last_s_idx = buf["observations"][-1][0]
-        cam_pos = self._camera_position(last_s_idx)
+        cam_pos = self._camera_position(buf["observations"][-1][0])
         if cam_pos is not None:
             self.landmark_last_factor_cam[landmark_id] = cam_pos
 
     def add_loop_closure_observation(
         self, landmark_id: int, state_idx: int, uv: np.ndarray
     ):
-        """Add a reprojection factor for a loop closure re-observation.
+        """Add a re-projection factor for a landmark re-detected from a distant pose.
 
-        This is for when you re-detect an existing landmark from a distant frame.
-        The landmark must already be initialized in the graph.
+        Uses the tighter loop_pixel_noise: one re-observation has to compete against
+        the whole accumulated IMU+visual chain to move the trajectory at all.
+
+        Args:
+            landmark_id: Existing landmark in the graph.
+            state_idx: Pose state index observing it.
+            uv: 2D pixel measurement [u, v].
+
+        Returns:
+            None.
         """
         if gtsam is None or self.cal is None:
             return
@@ -622,108 +779,98 @@ class GraphOptimizer:
             self.landmark_obs_count.get(landmark_id, 0) + 1
         )
 
-    def add_loop_closure_pose_constraint(
-        self,
-        current_idx: int,
-        matched_idx: int,
-        relative_pose,
-        noise_sigmas: np.ndarray = None,
-    ):
-        """Add a BetweenFactor<Pose3> for loop closure between two frames.
+    def _landmark_prior_noise(self, pt3_world: np.ndarray, buf: dict):
+        """Anisotropic regularization prior matched to triangulation uncertainty.
 
-        This provides a strong 6-DOF constraint that can correct accumulated drift,
-        unlike reprojection-only loop closure which is too weak for trajectory correction.
+        Projection factors pin bearing to sub-pixel while depth along the ray stays
+        ill-conditioned, so an isotropic prior is backwards: negligible laterally, yet
+        tight enough along the ray to assert depth confidence the geometry lacks. The
+        along-ray sigma is widened to the depth filter's sigma_z, clipped from below so
+        it is never tighter than the isotropic prior it replaces.
 
         Args:
-            current_idx: Current state index.
-            matched_idx: Matched (earlier) state index.
-            relative_pose: Measured relative pose T_matched_current (transform from
-                           current frame to matched frame in body coordinates).
-            noise_sigmas: 6-vector [rx, ry, rz, tx, ty, tz] noise sigmas.
-                          Default: [0.05, 0.05, 0.05, 0.15, 0.15, 0.15] (rad, m).
+            pt3_world: (3,) landmark position in the world frame.
+            buf: Buffer entry supplying first_state and depth-filter state.
+
+        Returns:
+            A gtsam noise model — anisotropic, or isotropic if the ray is degenerate.
         """
-        if gtsam is None:
-            return
-        if noise_sigmas is None:
-            noise_sigmas = np.array([0.05, 0.05, 0.05, 0.2, 0.2, 0.2])
-        noise_model = gtsam.noiseModel.Diagonal.Sigmas(noise_sigmas)
-        self.graph.add(
-            gtsam.BetweenFactorPose3(
-                X(matched_idx), X(current_idx), relative_pose, noise_model
-            )
-        )
+        sigma_perp = float(self.landmark_reg_sigma)
+        iso = gtsam.noiseModel.Isotropic.Sigma(3, sigma_perp)
+
+        ref_pos = self._camera_position(buf.get("first_state"))
+        if ref_pos is None:
+            return iso
+        ray = np.asarray(pt3_world, dtype=float) - np.asarray(ref_pos, dtype=float)
+        ray_norm = np.linalg.norm(ray)
+        if ray_norm < 1e-9:
+            return iso
+        f_hat = ray / ray_norm
+
+        # sigma_z = sigma_rho * z^2  (uncertainty propagated from inverse depth)
+        depth = 1.0 / max(abs(buf["df_mu"]), 1e-10)
+        sigma_z = float(np.sqrt(max(buf["df_sigma2"], 0.0))) * depth * depth
+        sigma_along = float(np.clip(
+            self.landmark_reg_along_k * sigma_z,
+            sigma_perp,
+            self.landmark_reg_along_max,
+        ))
+        if not np.isfinite(sigma_along):
+            return iso
+
+        fft = np.outer(f_hat, f_hat)
+        cov = sigma_perp ** 2 * (np.eye(3) - fft) + sigma_along ** 2 * fft
+        try:
+            return gtsam.noiseModel.Gaussian.Covariance(cov)
+        except Exception:
+            return iso
 
     def _update_depth_filter(self, buf: dict, observed_depths: List[float]):
-        """Update Vogiatzis Gaussian-Uniform mixture depth filter.
+        """Fold depth measurements into a landmark's Gaussian+uniform depth filter.
 
-        Models inverse depth as: p(d) = a * N(mu, sigma2) + (1-a) * U(1/d_max, 1/d_min)
-        Each depth measurement updates the mixture via Bayesian inference.
-        Inlier measurements tighten the Gaussian; outliers are absorbed by the uniform.
+        Filtering happens in inverse depth, where stereo triangulation noise is roughly
+        Gaussian and depth-independent; in metric depth it is neither.
 
         Args:
-            buf: Landmark buffer dict containing filter state (df_mu, df_sigma2, df_a, df_n).
-            observed_depths: Depth measurements from different cameras (meters).
+            buf: Buffer entry holding df_mu, df_sigma2, df_a, df_n (mutated in place).
+            observed_depths: Metric depths of this landmark from each observing camera.
+
+        Returns:
+            None.
         """
         d_min, d_max = self.depth_d_min, self.depth_d_max
-        uniform_range = 1.0 / d_min - 1.0 / d_max  # range in inverse depth
-        p_uniform = 1.0 / uniform_range
+        p_uniform = 1.0 / (1.0 / d_min - 1.0 / d_max)
         tau2 = self.depth_tau ** 2
 
         for depth in observed_depths:
             if depth <= d_min or depth > d_max:
                 continue
-
-            z = 1.0 / depth  # measurement in inverse depth
-            mu = buf["df_mu"]
-            sigma2 = buf["df_sigma2"]
-            a = buf["df_a"]
-
-            # Gaussian likelihood of this measurement
-            S = sigma2 + tau2
-            residual = z - mu
-            p_gauss = (1.0 / np.sqrt(2.0 * np.pi * S)) * np.exp(-0.5 * residual ** 2 / S)
-
-            # Posterior inlier probability
-            denom = a * p_gauss + (1.0 - a) * p_uniform
-            if denom < 1e-30:
-                continue
-            a_new = (a * p_gauss) / denom
-
-            # Kalman update of Gaussian component
-            K = sigma2 / S
-            mu_new = mu + K * residual
-            sigma2_new = (1.0 - K) * sigma2
-
-            buf["df_mu"] = mu_new
-            buf["df_sigma2"] = sigma2_new
-            buf["df_a"] = a_new
+            buf["df_mu"], buf["df_sigma2"], buf["df_a"] = gaussian_uniform_update(
+                buf["df_mu"], buf["df_sigma2"], buf["df_a"],
+                z=1.0 / depth, tau2=tau2, p_uniform=p_uniform,
+            )
             buf["df_n"] += 1
 
     def _max_parallax_deg(self, pt3_world: np.ndarray, observations: list) -> float:
-        """ Important note because this function is critical:
-        Compute max parallax angle (degrees) between any two observing cameras.
-        The parallax angle is the angle between the rays from two camera centers to the landmark.
-        It is directly proportional to the landmark's triangulation / depth uncertainty (sigma^2 ~ depth/sin(parallax)^2).
-        Also: (arctan (baseline / depth)) ≈ baseline/depth for small angles (1° parallax at 5m depth means ~8.7cm baseline).
-        This geometrical validation highly correlate with the quality of the results! Landmarks quality improve drastically,
-        And so does the iSAM2 convergence and stability, especially in the presence of outliers and noisy initial estimates.
-        Rejecting low-parallax landmarks prevents the optimizer from being corrupted by degenerate factors with near-zero Jacobians,
-        which can cause indeterminate linear systems and convergence failures.
+        """Widest parallax angle (deg) between any two cameras observing a landmark.
+
+        This is the single strongest quality signal for a landmark: triangulation
+        variance scales as ~1/sin(parallax)^2, so a low-parallax point has near-parallel
+        rays, near-zero Jacobians, and can render the linear system indeterminate.
+        Gating on it markedly improves both landmark quality and ISAM2 stability.
+
+        Args:
+            pt3_world: (3,) landmark position in the world frame.
+            observations: [(state_idx, uv), ...] views of the landmark.
+
+        Returns:
+            Maximum pairwise parallax in degrees, 0.0 with fewer than two known poses.
         """
-        estimate = self.get_current_estimate()
         cam_positions = []
         for s_idx, _ in observations:
-            if estimate is not None and estimate.exists(X(s_idx)):
-                pose = estimate.atPose3(X(s_idx))
-            elif self.initial.exists(X(s_idx)):
-                pose = self.initial.atPose3(X(s_idx))
-            else:
-                continue
-            if self.body_P_sensor is not None:
-                cam_pos = pose.compose(self.body_P_sensor).translation()
-            else:
-                cam_pos = pose.translation()
-            cam_positions.append(np.array(cam_pos))
+            world_T_cam = self._camera_pose(s_idx)
+            if world_T_cam is not None:
+                cam_positions.append(np.array(world_T_cam.translation()))
 
         if len(cam_positions) < 2:
             return 0.0
@@ -731,39 +878,36 @@ class GraphOptimizer:
         max_angle = 0.0
         for i in range(len(cam_positions)):
             ray_i = pt3_world - cam_positions[i]
-            norm_i = np.linalg.norm(ray_i)
-            if norm_i < 1e-10:
-                continue
             for j in range(i + 1, len(cam_positions)):
-                ray_j = pt3_world - cam_positions[j]
-                norm_j = np.linalg.norm(ray_j)
-                if norm_j < 1e-10:
-                    continue
-                cos_angle = np.dot(ray_i, ray_j) / (norm_i * norm_j)
-                angle = np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
-                if angle > max_angle:
-                    max_angle = angle
+                max_angle = max(
+                    max_angle, angle_between_deg(ray_i, pt3_world - cam_positions[j])
+                )
         return max_angle
 
     def _camera_position(self, state_idx: int) -> Optional[np.ndarray]:
-        """World position of the camera center for pose X(state_idx), or None."""
-        estimate = self.get_current_estimate()
-        if estimate is not None and estimate.exists(X(state_idx)):
-            pose = estimate.atPose3(X(state_idx))
-        elif self.initial.exists(X(state_idx)):
-            pose = self.initial.atPose3(X(state_idx))
-        else:
+        """World position of the camera center for pose X(state_idx).
+
+        Args:
+            state_idx: Pose state index.
+
+        Returns:
+            (3,) camera center in world coordinates, or None if the pose is unknown.
+        """
+        world_T_cam = self._camera_pose(state_idx)
+        if world_T_cam is None:
             return None
-        if self.body_P_sensor is not None:
-            return np.array(pose.compose(self.body_P_sensor).translation())
-        return np.array(pose.translation())
+        return np.array(world_T_cam.translation())
 
     def _obs_parallax_deg(self, landmark_id: int, state_idx: int) -> Optional[float]:
-        """Parallax angle (deg) at the landmark between the current camera and the
-        last camera that contributed a factor for this landmark.
+        """Incremental parallax (deg) since the last view that contributed a factor.
 
-        Returns None when there is no reference view yet or positions are unavailable,
-        signalling the caller not to gate on parallax.
+        Args:
+            landmark_id: Landmark being re-observed.
+            state_idx: Pose state index of the new observation.
+
+        Returns:
+            Angle in degrees, or None if there is no reference view yet — which tells
+            the caller not to gate on parallax rather than to reject.
         """
         ref_pos = self.landmark_last_factor_cam.get(landmark_id)
         if ref_pos is None:
@@ -785,82 +929,62 @@ class GraphOptimizer:
         return float(np.degrees(np.arccos(np.clip(cos_angle, -1.0, 1.0))))
 
     def _is_landmark_in_front(self, landmark_id: int, state_idx: int) -> bool:
-        """Check if a landmark has positive depth from the given pose's camera.
+        """Check that a landmark sits in front of the camera at X(state_idx).
 
-        Returns False if the landmark would project behind the camera, which
-        would cause singular Jacobians in the projection factor.
+        A landmark behind the camera gives the projection factor a singular Jacobian,
+        so it must be rejected rather than merely down-weighted. Unknown geometry
+        returns True: this gate should not drop observations it cannot evaluate.
+
+        Args:
+            landmark_id: Landmark to test.
+            state_idx: Pose state index to test from.
+
+        Returns:
+            True if depth exceeds 10 cm, or if the check cannot be made.
         """
         estimate = self.get_current_estimate()
-        # Get landmark position
-        if estimate is not None and estimate.exists(L(landmark_id)):
-            pt_world = estimate.atPoint3(L(landmark_id))
-        else:
-            return True  # Can't check, assume OK
-
-        # Get camera pose
-        if estimate is not None and estimate.exists(X(state_idx)):
-            world_T_body = estimate.atPose3(X(state_idx))
-        elif self.initial.exists(X(state_idx)):
-            world_T_body = self.initial.atPose3(X(state_idx))
-        else:
+        if estimate is None or not estimate.exists(L(landmark_id)):
             return True
-
-        if self.body_P_sensor is not None:
-            world_T_cam = world_T_body.compose(self.body_P_sensor)
-        else:
-            world_T_cam = world_T_body
-
-        # Transform to camera frame and check depth (Z > 0)
-        pt_cam = world_T_cam.transformTo(gtsam.Point3(*pt_world))
-        return pt_cam[2] > 0.1  # Minimum 10cm in front
+        world_T_cam = self._camera_pose(state_idx)
+        if world_T_cam is None:
+            return True
+        pt_world = estimate.atPoint3(L(landmark_id))
+        return world_T_cam.transformTo(gtsam.Point3(*pt_world))[2] > 0.1
 
     def _landmark_to_world(self, point_cam: np.ndarray, state_idx: int) -> np.ndarray:
-        """Transform a 3D point from camera frame to world frame.
+        """Lift a camera-frame point into the world using pose X(state_idx).
 
-        Uses the current estimate of pose X(state_idx) and body_P_sensor.
+        Args:
+            point_cam: (3,) point in the camera frame.
+            state_idx: Pose the point was observed from.
+
+        Returns:
+            (3,) point in world coordinates; identity pose is assumed if X is unknown.
         """
-        # Get current body pose in world
-        estimate = self.get_current_estimate()
-        if estimate is not None and estimate.exists(X(state_idx)):
-            world_T_body = estimate.atPose3(X(state_idx))
-        else:
-            # Fallback: check initial values
-            if self.initial.exists(X(state_idx)):
-                world_T_body = self.initial.atPose3(X(state_idx))
-            else:
-                world_T_body = gtsam.Pose3()
-
-        # world_T_cam = world_T_body * body_P_sensor
-        if self.body_P_sensor is not None:
-            world_T_cam = world_T_body.compose(self.body_P_sensor)
-        else:
-            world_T_cam = world_T_body
-
-        # Transform point from camera frame to world
+        world_T_cam = self._camera_pose(state_idx, default=gtsam.Pose3())
         pt_world = world_T_cam.transformFrom(gtsam.Point3(*point_cam))
         return np.array([pt_world[0], pt_world[1], pt_world[2]])
 
     # ==================== Optimization ====================
 
     def optimize(self):
+        """Fold the pending factors and values into the solver and re-solve.
+
+        A second ISAM2 pass is triggered only after a large relinearization, where one
+        Gauss-Newton step is unlikely to have converged.
+
+        Returns:
+            The updated gtsam.Values, or None without gtsam.
+        """
         if gtsam is None:
             return None
         self._cached_estimate = None  # Invalidate cache
         if self.isam is not None:
             try:
                 update_result = self.isam.update(self.graph, self.initial)
-                # error_diff = (
-                #     update_result.getErrorAfter() - update_result.getErrorBefore()
-                # )
-                # print(f"ISAM2 error change after update: {error_diff:.3f}, ")
                 self.graph.resize(0)
                 self.initial.clear()
-                # One extra iteration helps convergence
-
-                if (
-                    update_result.getVariablesRelinearized() > 50
-                    # or abs(error_diff) > 1.0
-                ):
+                if update_result.getVariablesRelinearized() > 50:
                     self.isam.update()
             except RuntimeError as e:
                 if "Indeterminant" in str(e) or "indeterminant" in str(e):
@@ -905,6 +1029,11 @@ class GraphOptimizer:
     # ==================== Helpers ====================
 
     def get_current_estimate(self):
+        """Latest solved values, cached until the next optimize() invalidates it.
+
+        Returns:
+            gtsam.Values, or None if nothing has been solved yet.
+        """
         if gtsam is None:
             return None
         if self._cached_estimate is not None:
@@ -915,7 +1044,11 @@ class GraphOptimizer:
         return None
 
     def get_optimized_landmarks(self) -> Dict[int, np.ndarray]:
-        """Get all optimized landmark 3D positions from the current estimate."""
+        """Read back every initialized landmark's optimized position.
+
+        Returns:
+            {landmark_id: (3,) world position} for landmarks present in the estimate.
+        """
         result = {}
         estimate = self.get_current_estimate()
         if estimate is None:
@@ -930,6 +1063,11 @@ class GraphOptimizer:
         return result
 
     def summarize(self):
+        """One-line graph size summary for per-keyframe logging.
+
+        Returns:
+            Formatted string with state, landmark, observation and factor counts.
+        """
         if gtsam is None:
             return "GTSAM not available"
         n_landmarks = len(self.landmark_initialized)
@@ -942,7 +1080,16 @@ class GraphOptimizer:
         )
 
     def diagnostics(self):
-        """Return optimization quality metrics."""
+        """Graph quality metrics, with the expensive term refreshed periodically.
+
+        factors.error() re-evaluates the whole graph, so its cost grows linearly with
+        trajectory length for telemetry alone. It refreshes every diagnostics_interval
+        keyframes and is held in between, keyed on state_index so repeated calls within
+        one keyframe cannot skip a refresh; the counts stay exact every call.
+
+        Returns:
+            Dict of error, variable/factor/landmark counts, and error_age_kf staleness.
+        """
         if gtsam is None:
             return {}
         result = self.get_current_estimate()
@@ -954,21 +1101,35 @@ class GraphOptimizer:
             factors = self._batch_graph
         else:
             return {}
-        total_error = factors.error(result)
+
         n_vars = result.size()
         n_factors = factors.size()
+
+        due = (
+            self._diag_last_idx is None
+            or self.state_index - self._diag_last_idx >= self.diagnostics_interval
+        )
+        if due:
+            self._diag_total_error = factors.error(result)
+            self._diag_last_idx = self.state_index
+        total_error = self._diag_total_error
         avg_error = total_error / max(n_factors, 1)
-        metrics = {
+
+        return {
             "total_error": total_error,
             "n_variables": n_vars,
             "n_factors": n_factors,
             "avg_error_per_factor": avg_error,
             "n_landmarks": len(self.landmark_initialized),
+            "error_age_kf": self.state_index - self._diag_last_idx,
         }
-        return metrics
 
     def drain_parallax_stats(self):
-        """Return (and clear) parallax-angle stats accumulated since the last call."""
+        """Return and clear parallax angles recorded since the last call.
+
+        Returns:
+            Dict with parallax_max_deg, parallax_median_deg and parallax_count.
+        """
         if not self.parallax_log:
             return {"parallax_max_deg": 0.0, "parallax_median_deg": 0.0, "parallax_count": 0}
         arr = np.asarray(self.parallax_log, dtype=float)
@@ -981,25 +1142,34 @@ class GraphOptimizer:
         return stats
 
     def drain_depth_filter_stats(self) -> Dict:
-        """Return (and clear) depth filter stats since last call."""
+        """Return and clear depth-filter outcome counts since the last call.
+
+        Returns:
+            Dict with attempted, promoted, outlier and pending counts.
+        """
         stats = dict(self._depth_stats)
         self._depth_stats = {"attempted": 0, "promoted": 0, "outlier": 0, "pending": 0}
         return stats
 
     def prune_stale_buffer(self, current_kf_idx: int) -> int:
-        """Remove buffer entries whose first observation is too old.
+        """Drop buffered landmarks the camera has stopped seeing.
 
-        Landmarks that haven't converged within buffer_max_age_kf keyframes
-        will never converge — the camera has moved on and won't re-see them.
-        Pruning them frees memory and reduces per-frame overhead.
+        Age is measured from the LAST observation: a landmark first seen 50 keyframes
+        ago but still tracked is alive, whereas one unseen for 20 is gone, since the
+        frontend only re-observes what KLT still follows. Without pruning the buffer is
+        monotonic — every landmark that never reaches 3 poses stays forever.
 
-        Returns number of pruned entries.
+        Args:
+            current_kf_idx: Current keyframe index.
+
+        Returns:
+            Number of pruned entries.
         """
         if self.buffer_max_age_kf <= 0:
             return 0
         cutoff = current_kf_idx - self.buffer_max_age_kf
         stale = [lm_id for lm_id, buf in self.landmark_buffer.items()
-                 if buf["first_state"] < cutoff]
+                 if buf["observations"][-1][0] < cutoff]
         for lm_id in stale:
             del self.landmark_buffer[lm_id]
         return len(stale)
@@ -1007,15 +1177,14 @@ class GraphOptimizer:
     # ==================== Landmark Uncertainty Filtering ====================
 
     def filter_uncertain_landmarks(self, max_trace: float = 2.0) -> int:
-        """Freeze landmarks whose position uncertainty exceeds a threshold.
+        """Freeze landmarks whose marginal position uncertainty is too large.
 
-        Computes the marginal covariance for each active (non-frozen) landmark
-        and freezes those where trace(cov) > max_trace. Frozen landmarks will
-        no longer receive new projection factors.
+        Frozen landmarks stop receiving projection factors, so a badly-constrained
+        point cannot keep dragging poses. Costs one marginal covariance per landmark,
+        which is why it is not called every keyframe.
 
         Args:
-            max_trace: Maximum allowed trace of 3x3 position covariance (m^2).
-                       Default 2.0 means avg std > ~0.8m per axis.
+            max_trace: Maximum allowed trace of the 3x3 position covariance (m^2).
 
         Returns:
             Number of newly frozen landmarks.
@@ -1047,9 +1216,13 @@ class GraphOptimizer:
     # ==================== Covariance & Degeneracy ====================
 
     def get_pose_covariance(self, state_idx: int) -> Optional[np.ndarray]:
-        """Get the 6x6 marginal covariance for pose X(state_idx).
+        """Marginal covariance of pose X(state_idx).
 
-        Returns None if computation fails. Ordered: [rot_x, rot_y, rot_z, tx, ty, tz].
+        Args:
+            state_idx: Pose state index.
+
+        Returns:
+            (6, 6) covariance ordered [rx, ry, rz, tx, ty, tz], or None if it fails.
         """
         if gtsam is None or self.isam is None:
             return None
@@ -1059,26 +1232,33 @@ class GraphOptimizer:
             return None
 
     def get_position_covariance(self, state_idx: int) -> Optional[np.ndarray]:
-        """Get the 3x3 position-only marginal covariance (translation block [3:6, 3:6])."""
+        """Translation block of the pose marginal covariance.
+
+        Args:
+            state_idx: Pose state index.
+
+        Returns:
+            (3, 3) position covariance, or None if it could not be computed.
+        """
         cov6 = self.get_pose_covariance(state_idx)
         if cov6 is None:
             return None
         return cov6[3:6, 3:6]
 
     def detect_degeneracy(self, state_idx: int, pos_cov: Optional[np.ndarray] = None) -> Dict:
-        """Analyze pose covariance to detect degenerate motion conditions.
+        """Classify motion degeneracy from the shape of the position covariance.
+
+        The eigenvectors say WHICH direction is unobservable and the condition number
+        says how badly, which is what distinguishes a genuinely degenerate motion from
+        merely large uncertainty.
 
         Args:
             state_idx: Pose state index to analyze.
-            pos_cov: Pre-computed 3x3 position covariance. If None, computed internally.
+            pos_cov: Pre-computed 3x3 position covariance; computed internally if None.
 
         Returns:
-            'position_eigenvalues': sorted eigenvalues of position cov (ascending)
-            'position_eigenvectors': corresponding eigenvectors (columns)
-            'condition_number': max/min eigenvalue ratio (high = degenerate)
-            'degenerate': bool
-            'degenerate_direction': unit vector of worst-constrained direction
-            'motion_type': string description
+            Dict with position_eigenvalues/eigenvectors, condition_number, degenerate,
+            degenerate_direction and motion_type.
         """
         result = {
             "position_eigenvalues": None,
@@ -1129,20 +1309,17 @@ class GraphOptimizer:
     # ==================== Factor Graph Visualization ====================
 
     def visualize_factor_graph_3d(self, output_path: str = "factor_graph_3d.html"):
-        """Render the GTSAM factor graph as an interactive 3D Plotly visualization.
+        """Render the factor graph in 3D: poses, landmarks, and typed factor edges.
 
-        Shows:
-          - Pose nodes (X) as red cubes along the trajectory, connected by a red line.
-          - Landmark nodes (L) as small green dots at their optimized 3D positions.
-          - Projection factor edges as thin blue lines (pose → landmark).
-          - IMU factor edges as thick orange lines (pose → pose).
-          - Prior factors as yellow markers on the constrained node.
-
-        This replicates the factor graph diagrams seen in VIO papers (e.g. Fig. 2
-        in Forster et al. 2017, Kimera paper Fig. 3) but in 3D with real coordinates.
+        The usual VIO factor-graph figure but in real coordinates — poses in red,
+        landmarks coloured by depth-filter sigma, projection factors grey, IMU orange,
+        between-factors purple.
 
         Args:
-            output_path: Path to save the interactive HTML file.
+            output_path: Path to write the interactive HTML file.
+
+        Returns:
+            The plotly Figure, or None if plotly is missing or nothing is solved.
         """
         try:
             import plotly.graph_objects as go

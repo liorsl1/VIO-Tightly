@@ -86,7 +86,136 @@ class DataManager:
         # Return pose array [x,y,z, qx,qy,qz,qw] and velocity vector
         return pos, vel, quat
 
-    def calculate_initial_biases_and_gravity(self, static_duration_sec=2):
+    def find_static_window(
+        self,
+        duration_sec=3.0,
+        anchor_time=None,
+        search_margin_sec=10.0,
+        stride_sec=0.05,
+        gyro_std_thresh=0.01,
+        accel_std_thresh=1.0,
+        gravity_dev_thresh=0.3,
+        verbose=True,
+    ):
+        """Find the most static `duration_sec` window of IMU data.
+
+        Gyro bias and gravity direction are only observable at rest, and the
+        attitude read off gravity is only valid at the instant it was measured —
+        so the window must be located by measurement, not assumed at t=0.
+
+        Candidates are scored by accel std + gyro std + |accel| deviation from
+        9.81, each normalized by its threshold so the terms are comparable; the
+        minimum wins. Thresholds only set the `is_static` warning flag.
+        `anchor_time` confines the search near where processing begins, so the
+        recovered attitude matches the first pose in the graph.
+
+        Returns a dict describing the winning window (indices, timestamps,
+        accel/gyro means and stds, `up_body` gravity direction, is_static).
+        """
+        t = self.imu_df["timestamp"].values.astype(float)
+        accel = self.imu_df[["a_x", "a_y", "a_z"]].values.astype(float)
+        gyro = self.imu_df[["w_x", "w_y", "w_z"]].values.astype(float)
+        n = len(t)
+
+        # Infer sample rate from the data rather than hardcoding 200 Hz.
+        dt_median = float(np.median(np.diff(t))) if n > 1 else 0.005
+        hz = 1.0 / max(dt_median, 1e-9)
+        win = max(int(round(duration_sec * hz)), 2)
+        step = max(int(round(stride_sec * hz)), 1)
+
+        if win >= n:
+            raise ValueError(
+                f"IMU record too short ({n} samples) for a {duration_sec}s window."
+            )
+
+        lo, hi = 0, n - win
+        if anchor_time is not None:
+            lo = max(int(np.searchsorted(
+                t, anchor_time - duration_sec - search_margin_sec)), 0)
+            hi = min(int(np.searchsorted(
+                t, anchor_time + search_margin_sec)) - win, n - win)
+            if hi < lo:  # anchor near a record boundary — search globally
+                lo, hi = 0, n - win
+
+        # Sliding mean/std via cumulative sums: O(n) instead of O(n * win).
+        def _windowed_mean_std(x):
+            c1 = np.concatenate([np.zeros((1, 3)), np.cumsum(x, axis=0)])
+            c2 = np.concatenate([np.zeros((1, 3)), np.cumsum(x ** 2, axis=0)])
+            starts = np.arange(lo, hi + 1, step)
+            mean = (c1[starts + win] - c1[starts]) / win
+            msq = (c2[starts + win] - c2[starts]) / win
+            return starts, mean, np.sqrt(np.maximum(msq - mean ** 2, 0.0))
+
+        starts, accel_mean, accel_std = _windowed_mean_std(accel)
+        _, gyro_mean, gyro_std = _windowed_mean_std(gyro)
+
+        accel_std_n = np.linalg.norm(accel_std, axis=1)
+        gyro_std_n = np.linalg.norm(gyro_std, axis=1)
+        gravity_norm = np.linalg.norm(accel_mean, axis=1)
+        gravity_dev = np.abs(gravity_norm - 9.81)
+
+        score = (
+            accel_std_n / accel_std_thresh
+            + gyro_std_n / gyro_std_thresh
+            + gravity_dev / gravity_dev_thresh
+        )
+        k = int(np.argmin(score))
+        s = int(starts[k])
+        e = s + win
+
+        a_mean = accel_mean[k]
+        up_body = a_mean / np.linalg.norm(a_mean)
+        is_static = bool(
+            accel_std_n[k] < accel_std_thresh
+            and gyro_std_n[k] < gyro_std_thresh
+            and gravity_dev[k] < gravity_dev_thresh
+        )
+
+        window = {
+            "start_idx": s,
+            "end_idx": e,
+            "t_start": float(t[s]),
+            "t_end": float(t[e - 1]),
+            "n_samples": win,
+            "accel_mean": a_mean,
+            "up_body": up_body,
+            "gyro_mean": gyro_mean[k],
+            "accel_std": accel_std[k],
+            "gyro_std": gyro_std[k],
+            "gravity_norm": float(gravity_norm[k]),
+            "score": float(score[k]),
+            "is_static": is_static,
+        }
+        self.static_window = window
+
+        if verbose:
+            t0 = float(t[0])
+            print(
+                f"  [StaticDetect] best {duration_sec:.1f}s window: "
+                f"t = {window['t_start'] - t0:.2f}..{window['t_end'] - t0:.2f}s "
+                f"(samples {s}..{e}, {hz:.0f} Hz)"
+            )
+            print(
+                f"    |accel| = {window['gravity_norm']:.4f} m/s^2  "
+                f"accel_std = {np.round(window['accel_std'], 4)}  "
+                f"gyro_std = {np.round(window['gyro_std'], 5)}"
+            )
+            print(f"    gravity direction in body frame: {np.round(up_body, 5)}")
+            if anchor_time is not None:
+                print(
+                    f"    anchored at t = {anchor_time - t0:.2f}s "
+                    f"(window ends {window['t_end'] - anchor_time:+.2f}s from it)"
+                )
+            if not is_static:
+                print(
+                    "    [WARN] best window still looks dynamic — gravity direction "
+                    "and gyro bias may be corrupted by motion."
+                )
+        return window
+
+    def calculate_initial_biases_and_gravity(
+        self, static_duration_sec=2, anchor_time=None, auto_detect=True
+    ):
         """
         Calculates IMU biases and performs gravity alignment.
 
@@ -97,68 +226,23 @@ class DataManager:
             world_gravity_vec (np.array): The ideal gravity vector in the world frame [0, 0, -g].
         """
 
-        # def from_two_vectors3(v0, v1, forward_reference=None):
-        #     """
-        #     Improved version that:
-        #     1. Properly aligns two vectors
-        #     2. Maintains a reference forward direction (optional)
-            
-        #     Args:
-        #         v0: Starting vector (in original frame)
-        #         v1: Target vector (in target frame)
-        #         forward_reference: Reference forward vector to constrain yaw (None for default)
-        #     Returns:
-        #         quaternion [x,y,z,w] that rotates v0 to v1 while minimizing yaw change
-        #     """
-        #     v0 = v0 / np.linalg.norm(v0)
-        #     v1 = v1 / np.linalg.norm(v1)
-        #     dot = np.dot(v0, v1)
-            
-        #     # Handle nearly parallel vectors
-        #     if dot > 0.999999:
-        #         return np.array([0.0, 0.0, 0.0, 1.0])  # Identity
-            
-        #     if dot < -0.999999:
-        #         # Find minimal rotation by aligning to a reference axis
-        #         axis = np.array([1.0, 0.0, 0.0]) if forward_reference is None else forward_reference
-        #         axis = axis - v0 * np.dot(axis, v0)  # Make orthogonal
-        #         axis = axis / np.linalg.norm(axis)
-        #         return np.array([axis[0], axis[1], axis[2], 0.0])  # 180° rotation
-            
-        #     # Standard case - compute rotation with yaw preservation
-        #     axis = np.cross(v0, v1)
-        #     axis = axis / np.linalg.norm(axis)
-        #     angle = np.arccos(dot)
-            
-        #     # Optional: Minimize yaw deviation using reference
-        #     if forward_reference is not None:
-        #         # Project reference onto plane orthogonal to rotation axis
-        #         ref_proj = forward_reference - axis * np.dot(forward_reference, axis)
-        #         if np.linalg.norm(ref_proj) > 1e-6:
-        #             ref_proj = ref_proj / np.linalg.norm(ref_proj)
-        #             # Find angle that best preserves the reference
-        #             optimal_angle = np.arctan2(
-        #                 np.dot(np.cross(v0, ref_proj), axis),
-        #                 np.dot(v0, ref_proj)
-        #             )
-        #             angle = optimal_angle
-            
-        #     return np.array([
-        #         axis[0] * np.sin(angle/2),
-        #         axis[1] * np.sin(angle/2),
-        #         axis[2] * np.sin(angle/2),
-        #         np.cos(angle/2)
-        #     ])
-        
-        imu_hz = 200  # Assuming 200Hz from your project
-        static_samples = int(static_duration_sec * imu_hz)
-        
-        accel_data = self.imu_df[["a_x", "a_y", "a_z"]].values[:static_samples]
-        gyro_data = self.imu_df[["w_x", "w_y", "w_z"]].values[:static_samples]
+        if auto_detect:
+            w = self.find_static_window(
+                duration_sec=static_duration_sec, anchor_time=anchor_time
+            )
+            lo, hi = w["start_idx"], w["end_idx"]
+        else:
+            imu_hz = 200  # Assuming 200Hz from your project
+            lo, hi = 0, int(static_duration_sec * imu_hz)
+
+        accel_data = self.imu_df[["a_x", "a_y", "a_z"]].values[lo:hi]
+        gyro_data = self.imu_df[["w_x", "w_y", "w_z"]].values[lo:hi]
 
         # 1. Calculate biases
         bias_gyro = gyro_data.mean(axis=0)
-        true_bias_accel = np.zeros(3)  # Assume zero for now
+        # Accel bias stays zero: from a single static attitude it is not
+        # separable from gravity magnitude/direction. ISAM2 refines it online.
+        true_bias_accel = np.zeros(3)
 
         # 2. Measure gravity vector in the IMU's local frame
         gravity_imu_frame = accel_data.mean(axis=0)
@@ -248,6 +332,42 @@ class DataManager:
 
 
         return K, dist_coeffs, new_K
+
+    def init_rectification(self):
+        """Build the rectification maps eagerly, before any frame is read.
+
+        R1/R2/P1/P2 are otherwise created lazily inside the first
+        rectify_stereo_images() call, which happens on the frontend thread — too
+        late for the backend, which needs R1 at construction time to express the
+        camera extrinsic in the rectified frame. Reads one image only to learn
+        the image size.
+
+        Returns (P1, P2).
+        """
+        if not hasattr(self, "map1_left"):
+            row = self.cam_df.iloc[0]
+            name = row.get("left_img_path") or row.get("filename_left") or row.get("filename")
+            img = cv2.imread(
+                os.path.join(self.data_dir, "cam0", "data", name), cv2.IMREAD_GRAYSCALE
+            )
+            if img is None:
+                raise RuntimeError(f"Could not read first cam0 image: {name}")
+            self.image_size = (img.shape[1], img.shape[0])
+            self.rectify_stereo_images(img, img)
+        return self.P1, self.P2
+
+    def T_imu_rect_cam0(self):
+        """Extrinsic of the RECTIFIED left camera in the body/IMU frame.
+
+        Rectification rotates the camera frame about its optical center by R1
+        (p_rect = R1 @ p_cam0), so the calibrated T_imu_cam0 does not describe
+        the frame that rectified pixels and stereo triangulations live in.
+        Composing with R1^T undoes that rotation; the translation is unchanged.
+        """
+        self.init_rectification()
+        T_rect = np.eye(4)
+        T_rect[:3, :3] = self.R1.T
+        return self.T_imu_cam0 @ T_rect
 
     def iter_stereo_frames(self, step=1, start_frame=0):
         """

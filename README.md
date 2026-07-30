@@ -15,9 +15,14 @@ A thorough implementation of stereo visual-inertial odometry + mapping system, w
 </p>
 
 <p align="center">
-  <img src="docs/factor_graph_vis.png" alt="Factor Graph 3D" width="600"/>
+  <img src="docs/factor_graph_vis.png" alt="Factor Graph 3D" width="52%"/>
+  <img src="docs/depth_uncertainty.png" alt="Depth Filter at Promotion" width="46%"/>
   <br/>
-  <sub>Factor graph visualization — 307 poses, 8035 landmarks observed, ~60k factors. Landmarks colored by depth uncertainty (relative) (green = low σ, red = high σ).</sub>
+  <sub>
+    <b>Left</b> — Factor graph: 307 poses, 8035 landmarks observed, ~60k factors. Landmarks colored by depth uncertainty (relative) (green = low σ, red = high σ).
+    <br/>
+    <b>Right</b> — Depth filter state at promotion: 5786 landmarks, depth σ median 0.167 m (range 0.004–0.487 m), inlier probability ≥ 0.52. The histogram is the promotion gate made visible — the sharp edge at 0.25 m is <code>depth_max_sigma_m</code>, and the thin tail past it comes from keyframes where lateral-degeneracy relaxation raised the cap to 0.5 m.
+  </sub>
 </p>
 
 ---
@@ -48,15 +53,16 @@ Processes stereo image pairs to produce landmark observations, 3D triangulations
 
 | Stage | Method | Purpose |
 |-------|--------|---------|
-| Feature Extraction | XFeat (1024 pts) | Repeatable keypoints with dense descriptors |
+| Feature Extraction | XFeat (`top_k = 2048`) | Repeatable keypoints with dense 64-D descriptors |
 | Stereo Matching | Cosine Similarity + Epipolar Filter | Left-right correspondence with geometric validation |
 | Temporal Tracking | KLT Optical Flow (forward-backward) | Frame-to-frame association; static features filtered by displacement threshold |
 | Triangulation | Linear SVD (rectified) | Depth from stereo disparity, filtered by reprojection error |
-| Keyframe Decision | Depth uncertainty from Parallax | Only frames with sufficient parallax are committed to the graph |
-| Loop Closure | HNSW descriptor index + frame voting | Re-observed landmarks from ≥15 frames ago, geometric visibility filter |
+| Detection Trigger | Grid coverage (25 px cells) | Detect only when tracks stop spanning the frame — a density, not a count |
+| Keyframe Decision | Accumulated median pixel displacement | Only frames with sufficient parallax are committed to the graph |
+| Loop Closure | HNSW index + similarity/IDF-weighted voting | Re-observed landmarks from ≥9 frames ago, geometric visibility filter |
 
-- **IMU-Guided Tracking**: When the optimizer converges (`avg_error < 2.0`), IMU-predicted rotation initializes optical flow for improved tracking under fast motion.
-- **Spatial Distribution**: Grid-based bucketing ensures well-distributed features across the image.
+- **IMU-Guided Tracking**: When the optimizer converges (`avg_error < 0.002`), IMU-predicted rotation initializes optical flow for improved tracking under fast motion.
+- **Spatial Distribution**: Grid-based bucketing ensures well-distributed features across the image — a 25 px grid drives *when to detect*, a 13 px grid drives *which observations become factors*.
 
 ### 2. IMU Preintegration (`imu_pipeline.py`)
 
@@ -77,17 +83,17 @@ Incremental nonlinear optimization via ISAM2 with explicit 3D landmarks.
 | `PriorFactorPose3` | X(0) | Anchors world frame origin |
 | `ImuFactor` | X(i), V(i), X(i+1), V(i+1), B(i) | IMU motion constraint |
 | `BetweenFactorConstantBias` | B(i), B(i+1) | Bias random walk (σ scaled by √Δt) |
-| `GenericProjectionFactorCal3_S2` | X(i), L(j) | Pixel reprojection (Huber k=1.345, σ=1.0 px) with body-camera extrinsic |
-| `PriorFactorPoint3` | L(j) | Landmark regularization (σ=1.5 m) |
+| `GenericProjectionFactorCal3_S2` | X(i), L(j) | Pixel reprojection (Huber k=1.345, σ=0.5 px) with body-camera extrinsic |
+| `PriorFactorPoint3` | L(j) | Anisotropic landmark regularization (σ⊥ = 1 m, σ∥ along the ray up to 6 m) |
 
-**Landmark lifecycle**: buffer (first sighting) → promote (3+ poses, parallax ≥ 2,5°, depth ∈ [0.2, 15] m, cheirality OK) → track (incremental-parallax gate ≥ 2°, grid bucketing 13×13 px).
+**Landmark lifecycle**: buffer (first sighting) → promote (3+ poses, parallax ≥ 5°, depth ∈ [0.2, 15] m, depth-filter converged, cheirality OK) → track (incremental-parallax gate ≥ 4.5°, grid bucketing 13×13 px) → pruned from the buffer after 80 keyframes unseen.
 
 ### 4. Keyframe Gating (`main_threaded.py`)
 
 | Mechanism | Condition |
 |-----------|-----------|
-| Initialization period | Every frame is a keyframe until covariance-trace relative std < 0.002 over 5 KF |
-| Keyframe decision | Accumulated median displacement ≥ 20 px since last keyframe |
+| Initialization period | Every frame is a keyframe until covariance-trace relative std < `INIT_STABLE_REL_STD` over 5 KF (currently `0.0`, so gating stays inert and every frame is committed) |
+| Keyframe decision | Accumulated median displacement ≥ 5.5 px since last keyframe |
 | Non-keyframe handling | Visual observations dropped; IMU accumulates across skipped frames |
 
 ### 5. Real-Time Visualization (`vio_visualizer.py`)
@@ -139,10 +145,24 @@ gate* throughout the pipeline. For small angles $\theta \approx \text{baseline}/
 Each visual factor's information is $\propto 1/\sigma_\text{px}^2$. A **tighter** sigma
 makes every factor more influential — but that only helps if the factors are
 geometrically well-conditioned. Tightening sigma without filtering weak (low-parallax)
-observations amplifies their harm. Hence the pixel-noise reduction (§4.1) is paired with
-an incremental-parallax observation gate (§3.3).
+observations amplifies their harm. Hence the pixel-noise reduction [4.1] is paired with
+an incremental-parallax observation gate [3.3].
 
-### 2.3 Keyframing
+### 2.3 Measurement count vs. measurement information  *(NEW)*
+Near-parallel re-observations of the same landmark are **not independent**: they share that
+landmark's own depth error as a common-mode term. Stacking $N$ of them multiplies the
+*apparent* information by $N$ while adding almost no new geometry, so the visual block
+becomes over-confident relative to the IMU and any landmark bias is amplified straight into
+pose bias. Expressed as depth precision, with angular noise
+$\sigma_\theta = \sigma_\text{px}/f \approx 0.0625°$:
+
+$$\frac{\sigma_d}{d} \;\approx\; \frac{\sigma_\theta}{\theta}
+\qquad\Rightarrow\qquad 2° \approx 3.1\%, \quad 4.5° \approx 1.4\%, \quad 7° \approx 0.9\%.$$
+
+This is why the incremental-parallax gate [3.3] *improves* accuracy while **removing** 18%
+of the projection factors — the discarded ones were redundant, not informative.
+
+### 2.4 Keyframing
 Consecutive high-rate frames carry redundant visual information yet each adds
 poses/factors and accumulates linearization error. A **keyframe** is committed only when
 the camera has moved enough to add real parallax; intermediate frames are skipped from
@@ -153,7 +173,7 @@ the graph but their IMU is still integrated (no inertial information is lost).
 ## 3. Landmark Lifecycle (`vio_optimizer.py`)
 
 ```
-First sighting ─► BUFFER ─► (3+ distinct poses & parallax ≥ 2.5°) ─► PROMOTE ─► TRACK
+First sighting ─► BUFFER ─► (3+ distinct poses & parallax ≥ 5°) ─► PROMOTE ─► TRACK
                   (needs 3D)    depth/cheirality checks               incremental-parallax gated
 ```
 
@@ -169,25 +189,27 @@ A buffered landmark is promoted only when **all** of these hold:
 - **3+ distinct observing poses** (re-checked at 3, then every even count, to avoid
   repeated expensive parallax computation).
 - **Depth in `[0.2 m, 15.0 m]`** (camera-frame `Z`), else permanently rejected.
-- **Max parallax angle ≥ 5°** (`_max_parallax_deg`), else kept in buffer to retry later.
+- **Max parallax angle ≥ 5°** (`_max_parallax_deg`), raised to **7°** under detected lateral
+  degeneracy; else kept in buffer to retry later.
+- **Depth filter converged** [12.7] — the gate that rejects most attempts in practice.
 - **Positive depth from every observing camera** (cheirality, `Z > 0.2 m`).
 
-On promotion: insert `L(id)`, add an isotropic **regularization prior (σ = 1.5 m)** to
-prevent indeterminate systems, and flush all buffered projection factors.
+On promotion: insert `L(id)`, add an **anisotropic regularization prior** [4.2] to prevent
+indeterminate systems, and flush all buffered projection factors.
 
 ### 3.3 Incremental-parallax observation gate (tracking)  *(NEW)*
 For a landmark **already in the graph**, a new projection factor is added only if the
 current camera has moved enough since the **last view that contributed a factor** for that
 landmark:
-- **`min_obs_parallax_deg = 2°`** — re-observations below this incremental parallax are
-  skipped (they add little depth information but, at tight pixel sigma, still pull the
-  pose).
+- **`min_obs_parallax_deg = 4.5°`** — re-observations below this incremental parallax are
+  skipped. They add little depth information but, at tight pixel sigma, still pull the pose;
+  worse, they are *not independent* of the views already present [2.3].
 - Bookkeeping: `landmark_last_factor_cam[id]` stores the reference camera center; seeded at
   promotion and advanced each time a factor is accepted.
 - Helpers: `_camera_position(state_idx)`, `_obs_parallax_deg(landmark_id, state_idx)`
   (returns `None` ⇒ no reference yet ⇒ not gated).
 
-This complements the tighter pixel sigma (§4.1): the looser old sigma implicitly discounted
+This complements the tighter pixel sigma [4.1]: the looser old sigma implicitly discounted
 weak factors; the tighter sigma needs them filtered explicitly.
 
 ---
@@ -195,17 +217,30 @@ weak factors; the tighter sigma needs them filtered explicitly.
 ## 4. Noise Models & Weighting (`vio_optimizer.py`)
 
 ### 4.1 Visual reprojection noise  *(UPDATED)*
-- **Huber robust, k = 1.345, σ = 1.0 px** (was 1.5 px). Lowering sigma measurably improved
-  accuracy; see §2.2.
+- **Huber robust, k = 1.345, σ = 0.5 px** (was 1.5 px). Lowering sigma measurably improved
+  accuracy; see [2.2].
+- Loop-closure re-observations use a separate, tighter model (σ = 0.2 px).
+
+### 4.2 Anisotropic landmark prior  *(NEW)*
+Projection factors pin a landmark's **bearing** to sub-pixel precision while constraining
+**depth along the ray** hardly at all. An isotropic prior is therefore backwards: negligible
+where the data is already strong, and over-confident along the ray where it is weakest.
+The prior is built from the ray direction $\hat f$ as
+
+$$\Sigma \;=\; \sigma_\perp^2\,(I - \hat f\hat f^{\!\top}) \;+\; \sigma_\parallel^2\,\hat f\hat f^{\!\top},
+\qquad \sigma_\parallel = \mathrm{clip}(k\,\sigma_z,\ \sigma_\perp,\ 6\,\text{m}),$$
+
+with $\sigma_z = \sigma_\rho d^2$ taken from the depth filter and $\sigma_\perp = 1$ m. Clipped
+from below so the prior is never *tighter* than the isotropic one it replaced.
 
 
 ### 4.3 Priors
 | Prior | Value | Purpose |
 |-------|-------|---------|
-| Pose `X(0)` | σ = [0.03 rad ×3, 0.10 m ×3] | Anchor first pose (tight rotation, moderate translation). |
-| Velocity `V(0)` | σ = 0.10 m/s | Anchor initial velocity. |
-| Bias `B(0)` | σ = [0.01 m/s² ×3, 0.003 rad/s ×3] | Trust static calibration, allow online refinement. |
-| Landmark regularization | isotropic σ = 1 m | Prevent indeterminate systems during relinearization. |
+| Pose `X(0)` | σ = [0.02 rad ×3, 0.10 m ×3] | Anchor first pose (tight rotation, moderate translation). |
+| Velocity `V(0)` | σ = 0.02 m/s | Anchor initial velocity. |
+| Bias `B(0)` | σ = [0.03 m/s² ×3, 0.01 rad/s ×3] | Trust static calibration, allow online refinement. |
+| Landmark regularization | anisotropic, σ⊥ = 1 m [4.2] | Prevent indeterminate systems during relinearization. |
 | Bias random walk | `imu_calib.bias_between_sigmas(dt)` | `BetweenFactorConstantBias`, scaled by interval. |
 
 ### 4.4 Cheirality handling
@@ -223,16 +258,18 @@ counter `kf_idx`** (not the raw frame index), keeping the graph and visualizer d
 Until the graph is trustworthy, **every frame is a keyframe** so constraints accumulate.
 After each optimize, the **position-covariance trace** is pushed to a rolling window:
 - **`INIT_STABLE_WINDOW = 5`** keyframes.
-- When the window's **relative std** (`std/mean`) falls below
-  **`INIT_STABLE_REL_STD = 0.002`**, initialization completes and keyframe gating switches on.
+- When the window's **relative std** (`std/mean`) falls below **`INIT_STABLE_REL_STD`**,
+  initialization completes and keyframe gating switches on. It is currently set to **`0.0`**,
+  which is unreachable — so in practice initialization never completes and *every* frame is
+  committed as a keyframe.
 
 ### 5.2 Keyframe decision (post-init)
 Per-frame median pixel displacement (parallax proxy from the frontend) is accumulated since
 the last keyframe. A frame becomes a keyframe when
 
-> `accumulated_disp ≥ KF_DISP_THRESHOLD` (**20.0 px**, tunable).
+> `accumulated_disp ≥ KF_DISP_THRESHOLD` (**5.5 px**, tunable).
 
-Non-keyframes drop their visual observations but **keep accumulating IMU** (§5.3).
+Non-keyframes drop their visual observations but **keep accumulating IMU** [5.3].
 
 ### 5.3 IMU accumulation across skipped frames
 Preintegration is **not** reset on skipped frames — it accumulates so a single `ImuFactor`
@@ -241,7 +278,7 @@ feedback) reset **only after a keyframe commits**. Bias for the next interval is
 `B(kf_idx)` after optimize.
 
 ### 5.4 Adaptive IMU-guided optical flow
-`use_imu_for_flow` toggles on `avg_error_per_factor < imu_flow_error_threshold` (**2.0**);
+`use_imu_for_flow` toggles on `avg_error_per_factor < imu_flow_error_threshold` (**0.002**);
 the IMU-derived inter-keyframe rotation is handed to the frontend (one-frame latency) only
 while the optimizer is converged.
 
@@ -260,16 +297,16 @@ while the optimizer is converged.
   number, avg error), and saves scatter/timeseries plots.
 
 **Empirical findings:** parallax ↔ covariance-trace correlation ≈ −0.35…−0.49 (confirms the
-triangulation physics of §2.1), saturating with a knee around ~5–10° max parallax /
-~20–30 px median displacement — which motivates the 5° promotion gate and the 20 px
-keyframe threshold.
+triangulation physics of [2.1]), saturating with a knee around ~5–10° max parallax /
+~20–30 px median displacement — which motivates the 5° promotion gate; the keyframe
+threshold itself was later lowered to 5.5 px.
 
 ---
 
 ## 7. Optimization Loop (ISAM2)
 
 - `isam.update(graph, initial)`, then clear pending graph/values.
-- If `> 8` variables were relinearized, run **one extra `isam.update()`** for convergence.
+- If `> 50` variables were relinearized, run **one extra `isam.update()`** for convergence.
 - **Indeterminate-system recovery:** catch the exception, discard the offending batch, and
   continue (instead of crashing).
 - Covariance via `marginalCovariance(X(kf_idx))`; degeneracy via eigen-analysis of the 3×3
@@ -282,10 +319,10 @@ keyframe threshold.
 | Parameter | Value |
 |-----------|-------|
 | `frame_step` | 10 |
-| `start_frame` | 400 (`40 × frame_step`) |
+| `start_frame` | 620 (`62 × frame_step`) |
 | `loop_closure_start_frame` | 10 (keyframes) |
 | `use_imu_for_flow` (initial) | `False` |
-| `imu_flow_error_threshold` | 2.0 |
+| `imu_flow_error_threshold` | 0.002 |
 | Matcher | XFeat (`matcher_type="xfeat"`, CPU) |
 | Dataset | EuRoC `MH_01_easy` |
 
@@ -296,16 +333,18 @@ keyframe threshold.
 ```mermaid
 flowchart TD
     subgraph Frontend["Frontend Thread (1 frame ahead)"]
-        A[Read Stereo Images] --> B[XFeat Extraction]
-        B --> C[Stereo Match + Triangulate]
-        C --> D[KLT Temporal Tracking]
+        A[Read Stereo Images] --> D[KLT Temporal Tracking]
         D --> E{IMU Rotation Available?}
         E -->|Yes| F[IMU-Guided KLT Guess]
         E -->|No| G[Standard KLT]
         F --> H[Forward-Backward Check]
         G --> H
         H --> RANSAC{2pt/5pt RANSAC}
-        RANSAC --> MD[Median Displacement]
+        RANSAC --> COV{Grid coverage < 0.18?}
+        COV -->|Yes| B[XFeat Extraction]
+        B --> C[Stereo Match + Triangulate]
+        C --> MD[Median Displacement]
+        COV -->|No| MD
         RANSAC --> I[HNSW Loop Candidates]
         MD --> J[Push to Queue]
         I --> J
@@ -329,7 +368,7 @@ flowchart TD
 
     subgraph Landmarks["Landmark Handling"]
         O --> P{Status?}
-        P -->|Initialized| Q[Cell + Incremental-Parallax 2deg Gate]
+        P -->|Initialized| Q[Cell + Incremental-Parallax 4.5deg Gate]
         P -->|Buffered| R[Cell Check -> Append]
         P -->|New| S[Cell Check -> Buffer]
         Q -->|Pass| T[Add Projection Factor]
@@ -379,24 +418,26 @@ flowchart TD
 | Factor type | `GenericProjectionFactorCal3_S2` | Explicit landmarks, incremental obs, loop closure |
 | Visual noise | Huber k=1.345, **σ = 0.5 px** | Tighter sigma improved accuracy (paired with parallax + depth gating) |
 | Loop-closure noise | Separate Huber model (σ = 0.2 px) | Tunable loop weighting without touching tracking |
-| Promotion gate | 3+ poses + parallax **≥ 2.5°** | Well-conditioned triangulation |
-| Observation gate | incremental parallax **≥ 2°** | Drop weak re-observations under tight sigma |
+| Promotion gate | 3+ poses + parallax **≥ 5°** (7° under degeneracy) | Well-conditioned triangulation |
+| Observation gate | incremental parallax **≥ 4.5°** | Drop redundant re-observations [2.3] |
 | Grid bucketing | **13×13 px**, 1 obs/cell/frame | Spatial diversity, avoid clustered factors |
-| Landmark prior | isotropic σ = 1 m | Prevent indeterminate systems |
+| Detection trigger | grid coverage < **0.18** on 25 px cells | Density, not a count — transfers across resolutions |
+| Buffer pruning | drop after **80 KF** unseen | Bounds backend growth |
+| Landmark prior | anisotropic, σ⊥ = 1 m | Match triangulation uncertainty, not defy it |
 | Depth range | **[0.2 m, 15.0 m]** | Reject degenerate triangulations |
-| Keyframe gate | accumulated displacement ≥ **20 px** | Commit only informative frames |
-| Init period | cov-trace rel_std < **0.002** over **5** KF | Stabilize before gating |
+| Keyframe gate | accumulated displacement ≥ **5.5 px** | Commit only informative frames |
+| Init period | cov-trace rel_std < **0.0** over **5** KF (inert) | Stabilize before gating |
 | IMU handling | accumulate across non-keyframes | One IMU factor per keyframe interval |
 | Cheirality | `throwCheirality=False` | Graceful degradation |
 | ISAM2 | relinearizeThreshold=0.03, skip=2 | Aggressive relinearization |
 | Threading | frontend 1 frame ahead, Queue(2) | Pipelined with backpressure |
-| IMU flow | adaptive on `avg_error < 2.0` | Use only when converged |
+| IMU flow | adaptive on `avg_error < 0.002` | Use only when converged |
 
 ---
 
-## 11. Reference Results (baseline)
+## 11. Reference Results
 
-
+### 11.1 Baseline (pre-gating)
 
 ```
 FINAL ATE (Absolute Trajectory Error)
@@ -415,6 +456,43 @@ FINAL RTE (Relative Trajectory Error)
   Std:     0.0960 m
   Segments: 324
 ```
+
+### 11.2 Current  *(NEW)*
+
+EuRoC `MH_01_easy`, coverage-triggered detection (25 px / 0.18), promotion parallax 5°,
+incremental-observation parallax 4.5°.
+
+```
+FINAL ATE (Absolute Trajectory Error)
+  RMSE:    0.0985 m
+  Mean:    0.0895 m
+  Median:  0.0793 m
+  Max:     0.2815 m
+  Std:     0.0412 m
+  Frames:  306
+
+FINAL RTE (Relative Trajectory Error)
+  RMSE:    0.1455 m
+  Mean:    0.1245 m
+  Median:  0.1176 m
+  Max:     0.4073 m
+  Std:     0.0753 m
+  Segments: 302
+```
+
+| Metric | Baseline | Current | Change |
+|--------|----------|---------|--------|
+| ATE RMSE | 0.1428 m | **0.0985 m** | −31% |
+| ATE max | 0.3997 m | **0.2815 m** | −30% |
+| RTE RMSE | 0.1866 m | **0.1455 m** | −22% |
+| Landmarks in graph | — | 5,786 | — |
+| Projection factors | — | 36,716 | — |
+| Condition number (median) | — | 1.80 | no degenerate keyframes |
+| Backend per keyframe | — | ~177 ms | — |
+
+RTE is alignment-free, so the fact that it improved *alongside* ATE rules out a favourable
+global alignment and indicates a genuine gain in local consistency. Note this was achieved
+with **fewer** visual factors than the baseline, not more — see [2.3].
 
 ---
 
@@ -481,3 +559,31 @@ FINAL RTE (Relative Trajectory Error)
 14. **Expanded gating log** — `gating_analysis_log.csv` now includes landmark/buffer counts,
     depth filter stats (attempted/promoted/outlier/pending), ATE RMSE + per-frame error,
     worst covariance eigenvector.
+15. **Coverage-based detection trigger** — replaced `MIN_TRACKED_FEATURES = 700` with a grid
+    occupancy criterion: detect when occupied cells fall below `min_occupied_fraction = 0.18`
+    on a `detect_cell_size = 25` px grid. 700 features on 752×480 is one per 22.7 px, so the
+    old count was always a *density* in disguise — and a count cannot distinguish features
+    spread across the frame from the same number crowded into one corner, which is precisely
+    what matters for conditioning. Now resolution- and scene-independent.
+16. **Parallax gates retuned** — promotion `2.5° → 5°` (7° under lateral degeneracy) and
+    incremental observation `2° → 4.5°`. This *removed* 18% of projection factors (in-graph
+    re-observation accept rate 49.8% → 20.7%) and improved both ATE and RTE, because the
+    discarded observations were redundant rather than informative [2.3].
+17. **Anisotropic landmark prior** — replaced the isotropic σ = 1 m regularization with a
+    ray-aligned covariance, loose along the depth direction and tight across it [4.2].
+18. **HNSW retrieval scoring** — three fixes. Descriptors are unit-normalized before indexing:
+    the running mean of unit descriptors has a norm that *shrinks* with view count
+    (1.00 → 0.38 over 16 views), which broke `cos = 1 − d²/2` and silently rejected genuinely
+    good matches (true cos 0.95 reported as 0.789). Votes are then weighted by similarity
+    instead of counted, and discounted by inverse frequency `log1p(M / df)` as in DBoW2.
+19. **Degeneracy response inverted** — under lateral degeneracy the parallax threshold now
+    *rises* to 7° rather than being relaxed. Low-parallax landmarks are exactly the ones whose
+    depth is unobservable in that configuration, so admitting more of them adds variables the
+    data cannot determine; parallax cannot be manufactured by lowering the parallax bar.
+20. **Buffer age pruning** — buffered landmarks unseen for `buffer_max_age_kf = 80` keyframes
+    are dropped, bounding backend cost per keyframe instead of letting it drift upward.
+21. **Refactor + pipeline reference** — shared primitives extracted to `vio_utils.py`
+    (geometric / probabilistic / trajectory-metric sections), dead code removed and docstrings
+    normalized across the four core modules. `vio_pipeline_flow.md` documents the full step
+    ordering, the factor graph contents, the landmark lifecycle, and the known structural
+    limits.

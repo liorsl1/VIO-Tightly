@@ -1,0 +1,12 @@
+numpy
+opencv-python
+pandas
+scipy
+PyYAML
+gtsam
+torch
+lightglue @ git+https://github.com/cvg/LightGlue.git
+plotly
+hnswlib
+rerun-sdk
+tqdm
