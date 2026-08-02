@@ -30,6 +30,7 @@ Frame i+1:                               Frame i:
 """
 
 import os
+import pickle
 import cv2
 import numpy as np
 import yaml
@@ -40,7 +41,8 @@ from queue import Queue, Empty, Full
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Any
 import time
-
+# set seed
+np.random.seed(42)
 import sys
 
 # sys.path.append(r"f:\Code\SLAM")
@@ -1077,6 +1079,18 @@ def main():
         from visualize_depth_filter import save_depth_log
         save_depth_log(optimizer.promoted_depth_log)
         optimizer.visualize_factor_graph_3d("factor_graph_3d.html")
+
+    # Save the landmark lifecycle trace — inspect with visualize_landmark_promotion.py
+    if optimizer.promotion_events:
+        try:
+            report = optimizer.landmark_promotion_report()
+            with open("landmark_promotion_report.pkl", "wb") as f:
+                pickle.dump(report, f)
+            print(f"Saved promotion report: {len(report['events'])} decisions over "
+                  f"{len(report['landmarks'])} graph landmarks "
+                  "-> landmark_promotion_report.pkl")
+        except Exception as e:
+            print(f"[promotion report] skipped: {e}")
 
     # --- Gate accounting: where did the visual observations go? ---
     try:

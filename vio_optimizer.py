@@ -34,6 +34,8 @@ class GraphOptimizer:
             self.initial = None
             self._depth_stats = {"attempted": 0, "promoted": 0, "outlier": 0, "pending": 0}
             self.promoted_depth_log = []
+            self.promotion_events = []
+            self.promotion_trace_enabled = False
             self._static_promotion_done = False
             self.landmark_buffer = {}
             self.landmark_initialized = set()
@@ -71,6 +73,9 @@ class GraphOptimizer:
         self.landmark_initialized = set()  # L(id) already in ISAM2 Values
         self.landmark_obs_count = {}  # {landmark_id: number of observations added}
         self.landmark_frozen = set()  # Landmarks frozen due to high uncertainty
+        # {landmark_id: (keyframe_index, covariance_trace)} at the moment of freezing —
+        # tells the promotion trace which promoted landmarks later went bad.
+        self.landmark_frozen_kf = {}
         # Buffer: landmarks wait here until they have 2+ observations from different poses
         # {landmark_id: {"point_cam": np.array, "first_state": int, "observations": [(state_idx, uv), ...]}}
         self.landmark_buffer = {}
@@ -165,10 +170,18 @@ class GraphOptimizer:
         self.depth_max_sigma_m = 0.25     # Max absolute depth sigma (meters)
         self.depth_min_inlier = 0.5   # Min inlier probability for convergence
         self.depth_outlier_thresh = 0.3  # Below this → landmark is outlier, remove
-        self.buffer_max_age_kf = 80      # Drop buffered landmarks unseen for this many keyframes
+        self.buffer_max_age_kf = 70      # Drop buffered landmarks unseen for this many keyframes
         self._depth_stats = {"attempted": 0, "promoted": 0, "outlier": 0, "pending": 0}
         self.promoted_depth_log = []  # [(landmark_id, pt3_world, depth_mu, depth_sigma2, df_a, df_n)]
         self._static_promotion_done = False  # One-time cold-start bypass
+
+        # --- Landmark lifecycle trace -------------------------------------------
+        # gate_stats counts WHERE landmarks are lost; this records WHICH ones and with
+        # what geometry, so the promotion decision can be second-guessed offline
+        # (see visualize_landmark_promotion.py). Bookkeeping only, bounded in size.
+        self.promotion_trace_enabled = True
+        self.promotion_events = []
+        self.promotion_events_max = 300000
 
     GATE_KEYS = (
         # Case 1: landmark already in the graph
@@ -607,6 +620,10 @@ class GraphOptimizer:
                 continue
 
             # Promote (bypass depth filter and parallax checks)
+            self._log_promotion_event(
+                lm_id, buf, "promoted_coldstart", pt3_world,
+                self._max_parallax_deg(pt3_world, buf["observations"]),
+            )
             self.landmark_buffer.pop(lm_id)
             self._depth_stats["promoted"] += 1
             self.promoted_depth_log.append((
@@ -619,6 +636,73 @@ class GraphOptimizer:
         if promoted > 0:
             print(f"  [COLD-START] Force-promoted {promoted}/{len(candidates)} landmarks from buffer")
         return promoted
+
+    def _log_promotion_event(self, landmark_id: int, buf: dict, outcome: str,
+                             pt3_world: np.ndarray = None, max_parallax: float = None):
+        """Record the full state of one landmark at a lifecycle decision point.
+
+        Every quantity the gates actually test is stored alongside the outcome, so an
+        offline script can ask whether the rejected landmarks really were worse than the
+        promoted ones instead of only seeing the survivors.
+
+        Args:
+            landmark_id: Landmark the decision concerns.
+            buf: Its buffer entry (depth-filter state and observations).
+            outcome: Which branch fired — see the outcome strings in _promote_landmark.
+            pt3_world: World position, when it has been computed at that point.
+            max_parallax: Max pairwise parallax (deg), when it has been computed.
+
+        Returns:
+            None.
+        """
+        if not self.promotion_trace_enabled:
+            return
+        if len(self.promotion_events) >= self.promotion_events_max:
+            return
+
+        mu = float(buf["df_mu"])
+        sigma2 = max(float(buf["df_sigma2"]), 0.0)
+        sigma_rho = float(np.sqrt(sigma2))
+        depth_est = 1.0 / max(abs(mu), 1e-10)
+        observations = buf["observations"]
+        poses = buf.get("poses") or {s for s, _ in observations}
+
+        # Gates that fire before pt3_world is computed still need a position, otherwise
+        # the biggest loss populations cannot be placed on a map — and where a landmark
+        # died is exactly what tells us which parts of the scene the frontend struggles
+        # in. Fall back to the first-view stereo triangulation, which is the only
+        # position those landmarks ever had.
+        raw_position = pt3_world is None
+        if raw_position:
+            try:
+                pt3_world = self._landmark_to_world(buf["point_cam"], buf["first_state"])
+            except Exception:
+                pt3_world = None
+
+        self.promotion_events.append({
+            "kf": int(self.state_index),
+            "lm_id": int(landmark_id),
+            "outcome": outcome,
+            "pt3_world": None if pt3_world is None
+                         else np.asarray(pt3_world, dtype=float).copy(),
+            # True when the position above is raw triangulation, not the gated estimate
+            "pos_is_raw": bool(raw_position),
+            # Depth as stereo first triangulated it, vs. what the filter converged to
+            "tri_depth": float(buf["point_cam"][2]),
+            "depth_est": depth_est,
+            "df_mu": mu,
+            "df_sigma2": sigma2,
+            "df_a": float(buf["df_a"]),
+            "df_n": int(buf["df_n"]),
+            "sigma_rho": sigma_rho,
+            "rel_sigma": sigma_rho / max(abs(mu), 1e-10),
+            "sigma_depth_m": sigma_rho * depth_est * depth_est,
+            "max_parallax_deg": None if max_parallax is None else float(max_parallax),
+            "n_obs": len(observations),
+            "n_poses": len(poses),
+            "first_kf": int(buf["first_state"]),
+            "age_kf": int(self.state_index - buf["first_state"]),
+        })
 
     def _promote_landmark(self, landmark_id: int):
         """Move a buffered landmark into the graph once its geometry is trustworthy.
@@ -641,6 +725,7 @@ class GraphOptimizer:
         if depth < self.depth_d_min or depth > self.depth_d_max:
             # Bad triangulation — remove permanently
             self.gate_stats["p_depth_range"] += 1
+            self._log_promotion_event(landmark_id, buf, "reject_depth_range")
             self.landmark_buffer.pop(landmark_id)
             return
 
@@ -665,6 +750,8 @@ class GraphOptimizer:
             if pt_cam[2] < 0.2:  # Behind camera or too close
                 # Keep in buffer — pose estimates may improve later
                 self.gate_stats["p_cheirality"] += 1
+                self._log_promotion_event(landmark_id, buf, "retry_cheirality",
+                                          pt3_world, max_parallax)
                 return
             observed_depths.append(float(pt_cam[2]))
 
@@ -676,6 +763,8 @@ class GraphOptimizer:
                 # Landmark is likely an outlier — remove permanently
                 self._depth_stats["outlier"] += 1
                 self.gate_stats["p_outlier"] += 1
+                self._log_promotion_event(landmark_id, buf, "reject_outlier",
+                                          pt3_world, max_parallax)
                 self.landmark_buffer.pop(landmark_id)
                 return
             rel_sigma = np.sqrt(buf["df_sigma2"]) / max(abs(buf["df_mu"]), 1e-10)
@@ -688,15 +777,20 @@ class GraphOptimizer:
                 # Not converged yet — keep in buffer for more observations
                 self._depth_stats["pending"] += 1
                 self.gate_stats["p_pending"] += 1
+                self._log_promotion_event(landmark_id, buf, "retry_depth_pending",
+                                          pt3_world, max_parallax)
                 return
 
         # Parallax gate (checked after depth filter so filter can accumulate)
         if max_parallax < self.parallax_threshold:
             self.gate_stats["p_parallax"] += 1
+            self._log_promotion_event(landmark_id, buf, "retry_parallax",
+                                      pt3_world, max_parallax)
             return
 
         # All checks passed — pop from buffer and commit to graph
         self.gate_stats["p_promoted"] += 1
+        self._log_promotion_event(landmark_id, buf, "promoted", pt3_world, max_parallax)
         self.landmark_buffer.pop(landmark_id)
         if self.depth_filter_enabled:
             self._depth_stats["promoted"] += 1
@@ -1151,6 +1245,89 @@ class GraphOptimizer:
         self._depth_stats = {"attempted": 0, "promoted": 0, "outlier": 0, "pending": 0}
         return stats
 
+    def landmark_promotion_report(self, with_covariance: bool = True) -> Dict:
+        """Bundle the promotion trace with the final graph state for offline analysis.
+
+        Pairs each landmark's state at promotion with where the optimizer ultimately put
+        it, which is what makes the depth uncertainty checkable: a well-calibrated sigma
+        should bracket how far the solution actually moved.
+
+        Args:
+            with_covariance: Also query each landmark's marginal covariance. One
+                marginals solve per landmark, so it is only affordable at shutdown.
+
+        Returns:
+            Dict with events, params, final landmark states, poses and leftover buffer.
+        """
+        report = {
+            "events": list(self.promotion_events),
+            "params": {
+                "parallax_threshold": self.parallax_threshold,
+                "min_obs_parallax_deg": self.min_obs_parallax_deg,
+                "depth_d_min": self.depth_d_min,
+                "depth_d_max": self.depth_d_max,
+                "depth_tau": self.depth_tau,
+                "depth_convergence_rel": self.depth_convergence_rel,
+                "depth_max_sigma_m": self.depth_max_sigma_m,
+                "depth_min_inlier": self.depth_min_inlier,
+                "depth_outlier_thresh": self.depth_outlier_thresh,
+                "buffer_max_age_kf": self.buffer_max_age_kf,
+                "obs_cell_size": self.obs_cell_size,
+                "landmark_reg_sigma": self.landmark_reg_sigma,
+                "landmark_reg_along_k": self.landmark_reg_along_k,
+                "landmark_reg_along_max": self.landmark_reg_along_max,
+            },
+            "landmarks": {},
+            "poses": {},
+            "buffer_at_end": [],
+            "n_states": int(self.state_index) + 1,
+        }
+        if gtsam is None:
+            return report
+
+        estimate = self.get_current_estimate()
+        if estimate is not None:
+            for idx in range(self.state_index + 1):
+                if estimate.exists(X(idx)):
+                    t = estimate.atPose3(X(idx)).translation()
+                    report["poses"][idx] = np.array([t[0], t[1], t[2]])
+
+        for lm_id in self.landmark_initialized:
+            entry = {
+                "obs_count": int(self.landmark_obs_count.get(lm_id, 0)),
+                "frozen": lm_id in self.landmark_frozen,
+                "frozen_kf": self.landmark_frozen_kf.get(lm_id, (None, None))[0],
+                "position": None,
+                "cov_trace": None,
+            }
+            try:
+                if estimate is not None and estimate.exists(L(lm_id)):
+                    p = estimate.atPoint3(L(lm_id))
+                    entry["position"] = np.array([p[0], p[1], p[2]])
+            except Exception:
+                pass
+            if with_covariance and self.isam is not None:
+                try:
+                    entry["cov_trace"] = float(np.trace(self.isam.marginalCovariance(L(lm_id))))
+                except Exception:
+                    pass
+            report["landmarks"][int(lm_id)] = entry
+
+        # Landmarks that never escaped the buffer: the silent majority of the funnel
+        for lm_id, buf in self.landmark_buffer.items():
+            report["buffer_at_end"].append({
+                "lm_id": int(lm_id),
+                "df_mu": float(buf["df_mu"]),
+                "df_sigma2": float(buf["df_sigma2"]),
+                "df_a": float(buf["df_a"]),
+                "df_n": int(buf["df_n"]),
+                "n_obs": len(buf["observations"]),
+                "n_poses": len(buf.get("poses", set())),
+                "first_kf": int(buf["first_state"]),
+                "last_kf": int(buf["observations"][-1][0]),
+            })
+        return report
+
     def prune_stale_buffer(self, current_kf_idx: int) -> int:
         """Drop buffered landmarks the camera has stopped seeing.
 
@@ -1171,6 +1348,7 @@ class GraphOptimizer:
         stale = [lm_id for lm_id, buf in self.landmark_buffer.items()
                  if buf["observations"][-1][0] < cutoff]
         for lm_id in stale:
+            self._log_promotion_event(lm_id, self.landmark_buffer[lm_id], "buffer_pruned")
             del self.landmark_buffer[lm_id]
         return len(stale)
 
@@ -1200,10 +1378,12 @@ class GraphOptimizer:
                 cov = self.isam.marginalCovariance(L(lm_id))
                 if np.trace(cov) > max_trace:
                     self.landmark_frozen.add(lm_id)
+                    self.landmark_frozen_kf[lm_id] = (self.state_index, float(np.trace(cov)))
                     newly_frozen += 1
             except Exception:
                 # Covariance computation can fail for poorly connected variables
                 self.landmark_frozen.add(lm_id)
+                self.landmark_frozen_kf[lm_id] = (self.state_index, float("nan"))
                 newly_frozen += 1
 
         if newly_frozen > 0:
