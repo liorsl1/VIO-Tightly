@@ -28,6 +28,11 @@ A thorough implementation of stereo visual-inertial odometry + mapping system, w
 ###### Trajectory Error Summary:
 <P> <sub> ATE: 0.098m | RTE : 0.145 (EuroC MH01)</sub> </P>
 
+---
+#### Bonus: Algorithm run on a Unity based Simulator (All sensor data comes from sim in realtime)
+  <img src="docs/vio_warehouse.gif" alt="Sim Run" width="800"/>
+  <img src="docs/vio_industry.gif" alt="Sim Run" width="800"/>
+
 ----
 
 ## System Architecture
